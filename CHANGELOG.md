@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `workspace/didChangeWatchedFiles` is forwarded only from one watcher client, the earliest connected one which got the watched files registration
 - `workspace/*/refresh` server requests (now including `workspace/foldingRange/refresh`) only reach clients declaring `refreshSupport`
 - `workspace/configuration` is forwarded only to a client declaring `workspace.configuration`; without one it's answered with `null` for every item instead of never
+- `instance_timeout` counts from the last client's disconnect instead of the last message any client sent, so a short timeout no longer kills an instance right after a long-connected client leaves
 
 
 ## [v0.3.0] - 2025-10-12

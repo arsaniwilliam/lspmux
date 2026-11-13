@@ -111,8 +111,10 @@ Example configuration file:
 # all configuration options here are set to their default value they'll have if
 # they're not present in the file or if the config file is missing completely.
 
-# time in seconds after which a rust-analyzer server instance with no clients
-# connected will get killed to save system memory.
+# time in seconds a server instance survives after its last client disconnected;
+# then it gets killed to save system memory. it lives as long as any client is
+# connected. a few seconds is enough to survive a client reconnecting (an editor
+# restarting its language client).
 #
 # you can set this option to `false` for infinite timeout
 instance_timeout = 300 # after 5 minutes

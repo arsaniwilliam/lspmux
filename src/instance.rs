@@ -474,6 +474,11 @@ impl Instance {
 
         let mut clients = self.clients.lock().await;
         let removed = clients.remove(&client.id());
+        if clients.is_empty() {
+            // Idle time counts from the last disconnect, not the last message, so
+            // `instance_timeout` is a grace period after the last client leaves.
+            self.keep_alive();
+        }
 
         self.dynamic_capabilities
             .lock()
