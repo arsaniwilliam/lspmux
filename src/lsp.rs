@@ -113,7 +113,7 @@ pub struct WorkspaceFolder {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
-    capabilities: serde_json::Value,
+    pub capabilities: serde_json::Value,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     server_info: Option<ServerInfo>,
@@ -157,33 +157,4 @@ pub struct UnregistrationParams {
 pub struct Unregistration {
     pub id: String,
     pub method: String,
-}
-
-/// Params for `textDocument/didOpen` notification
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct DidOpenTextDocumentParams {
-    pub text_document: TextDocumentItem,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TextDocumentItem {
-    pub uri: String,
-    pub language_id: String,
-    pub version: u64,
-    pub text: String,
-}
-
-/// Params for `textDocument/didClose` notification
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct DidCloseTextDocumentParams {
-    pub text_document: TextDocumentIdentifier,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TextDocumentIdentifier {
-    pub uri: String,
 }

@@ -231,7 +231,7 @@ async fn connect(
 }
 
 // Parse a file path as String out of a LSP `URI` type.
-fn parse_root_uri(root_uri: &str) -> Result<String> {
+pub(crate) fn parse_root_uri(root_uri: &str) -> Result<String> {
     let (scheme, _, mut path, _, _) = URI::try_from(root_uri)
         .context("failed to parse URI")?
         .into_parts();
@@ -367,7 +367,7 @@ async fn output_task(
 
             Message::Request(mut req) => {
                 req.id = req.id.tag(Tag::ClientId(client.id));
-                if instance.send_message(req.into()).await.is_err() {
+                if instance.forward_request(client.id, req).await.is_err() {
                     break;
                 }
             }
@@ -387,13 +387,32 @@ async fn output_task(
                 }
             },
 
-            Message::ResponseError(res) => {
-                warn!(?res, "client responded with error");
-            }
+            Message::ResponseError(mut res) => match res.id.untag() {
+                (Some(Tag::Forward), id) => {
+                    res.id = id;
+                    if instance.send_message(res.into()).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {
+                    warn!(?res, "client responded with error");
+                }
+            },
 
             Message::Notification(notif) if notif.method == "textDocument/didOpen" => {
-                if let Err(err) = instance.open_file(client.id, notif.params).await {
-                    warn!(?err, "error opening file");
+                match instance.open_file(client.id, notif.params).await {
+                    Ok(diagnostics) => {
+                        for notif in diagnostics {
+                            let _ = client.send_message(notif.into()).await;
+                        }
+                    }
+                    Err(err) => warn!(?err, "error opening file"),
+                }
+            }
+
+            Message::Notification(notif) if notif.method == "textDocument/didChange" => {
+                if let Err(err) = instance.change_file(client.id, notif.params).await {
+                    warn!(?err, "error changing file");
                 }
             }
 
@@ -403,8 +422,21 @@ async fn output_task(
                 }
             }
 
+            Message::Notification(mut notif) if notif.method == "$/cancelRequest" => {
+                // The server knows the request under its tagged ID
+                match serde_json::from_value::<RequestId>(notif.params["id"].take()) {
+                    Ok(id) => {
+                        notif.params["id"] = serde_json::to_value(id.tag(Tag::ClientId(client.id))).unwrap();
+                        if instance.forward_notification(notif).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => warn!(?err, "invalid $/cancelRequest id"),
+                }
+            }
+
             Message::Notification(notif) => {
-                if instance.send_message(notif.into()).await.is_err() {
+                if instance.forward_notification(notif).await.is_err() {
                     break;
                 }
             }

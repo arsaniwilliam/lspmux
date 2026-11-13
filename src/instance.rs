@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -20,8 +20,11 @@ use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
 use crate::client::Client;
 use crate::config::Config;
+use crate::docs::{self, Docs, PositionEncoding, ReadUri, Snapshot};
 use crate::lsp::ext::Tag;
-use crate::lsp::jsonrpc::{Message, Notification, Request, RequestId, ResponseSuccess, Version};
+use crate::lsp::jsonrpc::{
+    self, Message, Notification, Request, RequestId, ResponseError, ResponseSuccess, Version,
+};
 use crate::lsp::transport::{LspReader, LspWriter};
 use crate::lsp::{self, ext};
 
@@ -37,23 +40,50 @@ pub struct InstanceKey {
 }
 
 /// Language server instance
+///
+/// # Lock order
+///
+/// When more than one of the mutexes is held at the same time they must be
+/// acquired in this order (any subset, skipping is fine):
+///
+/// `clients` → `dynamic_capabilities` → `docs` → `request_snapshots` →
+/// `execute_commands`
+///
+/// `docs` is held across sends into the server channel so client document
+/// resyncs and the request they're for reach the server without other
+/// clients' messages in between.
 pub struct Instance {
     key: InstanceKey,
 
     /// Language server child process id
     pid: u32,
 
-    /// Server's response to `initialize` request
+    /// Server's response to `initialize` request, rewritten for clients
     init_result: lsp::InitializeResult,
+
+    /// Response to `workspace/workspaceFolders` server requests: the folders
+    /// the instance was initialized with
+    workspace_folders: Value,
 
     /// Handle for sending messages to the language server instance
     server: mpsc::Sender<Message>,
 
-    /// Data of associated clients
-    clients: Mutex<HashMap<usize, ClientData>>,
+    /// Associated clients
+    clients: Mutex<HashMap<usize, Client>>,
 
     /// Dynamic capabilities registered by the server
     dynamic_capabilities: Mutex<HashMap<String, lsp::Registration>>,
+
+    /// Client and server copies of open documents and cached diagnostics
+    docs: Mutex<Docs>,
+
+    /// Document state of each client request the server hasn't responded to
+    /// yet, at the time it was sent, keyed by the tagged request ID
+    request_snapshots: Mutex<HashMap<String, Snapshot>>,
+
+    /// Client `workspace/executeCommand` requests, used to route server
+    /// requests back to the triggering client
+    execute_commands: Mutex<ExecuteCommandTracker>,
 
     /// Wakes up `wait_task` and asks it to send SIGKILL to the instance.
     close: Notify,
@@ -71,31 +101,257 @@ impl Drop for Instance {
     }
 }
 
-/// Wrapper around client handle with additional data only the server instance
-/// knows about
-struct ClientData {
-    /// Handle for sending messages to clients
-    client: Client,
-
-    /// URIs of files currently opened by this client
-    files: HashSet<String>,
+/// A client `workspace/executeCommand` request the server hasn't responded to
+struct InFlightCommand {
+    /// Tagged request ID
+    key: String,
+    client_id: usize,
+    /// The client disconnected, the entry stays until the server responds
+    orphaned: bool,
+    /// The client's documents when the command was sent
+    snapshot: Snapshot,
 }
 
-impl ClientData {
-    fn get_status(&self) -> ext::Client {
-        ext::Client {
-            id: self.client.id(),
-            files: self.files.iter().cloned().collect(),
+/// Book-keeping of client `workspace/executeCommand` requests
+#[derive(Default)]
+struct ExecuteCommandTracker {
+    /// In arrival order
+    in_flight: Vec<InFlightCommand>,
+}
+
+impl ExecuteCommandTracker {
+    /// Distinct clients with commands in flight
+    fn owners(&self) -> Vec<Owner> {
+        let mut owners = Vec::<Owner>::new();
+        for command in &self.in_flight {
+            if let Some(owner) = owners.iter_mut().find(|o| o.client_id == command.client_id) {
+                owner.orphaned |= command.orphaned;
+            } else {
+                owners.push(Owner {
+                    client_id: command.client_id,
+                    orphaned: command.orphaned,
+                });
+            }
+        }
+        owners
+    }
+
+    /// Document snapshots of `client_id`'s commands in flight
+    fn snapshots_of(&self, client_id: usize) -> impl Iterator<Item = &Snapshot> {
+        self.in_flight
+            .iter()
+            .filter(move |command| command.client_id == client_id)
+            .map(|command| &command.snapshot)
+    }
+}
+
+/// Client with a `workspace/executeCommand` request in flight
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owner {
+    client_id: usize,
+    orphaned: bool,
+}
+
+/// Choose the client a server request caused by `workspace/executeCommand`
+/// belongs to, or the reason why it can't be determined (fail closed)
+///
+/// A server request doesn't say which command caused it, so it is attributed
+/// only when exactly one connected client has commands in flight. Which
+/// documents a client has open says nothing about ownership: a command may
+/// edit a file only another client has open.
+fn select_request_owner(owners: &[Owner]) -> Result<usize, &'static str> {
+    match owners {
+        [] => Err("no workspace/executeCommand in flight"),
+        [owner] if owner.orphaned => Err("the client which triggered the request disconnected"),
+        [owner] => Ok(owner.client_id),
+        _ if owners.iter().any(|owner| owner.orphaned) => {
+            Err("a disconnected client has a workspace/executeCommand in flight")
+        }
+        _ => Err("several clients have a workspace/executeCommand in flight"),
+    }
+}
+
+/// URIs of all documents touched by `WorkspaceEdit`s anywhere in `value`
+///
+/// Every object with a `changes` map or a `documentChanges` list counts as a
+/// `WorkspaceEdit`, so this covers `workspace/applyEdit` params as well as
+/// results like code actions or renames.
+fn workspace_edit_uris(value: &Value) -> Vec<String> {
+    let mut uris = Vec::new();
+    collect_workspace_edit_uris(value, &mut uris);
+    uris
+}
+
+fn collect_workspace_edit_uris(value: &Value, uris: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            let changes = object.get("changes").and_then(Value::as_object);
+            let document_changes = object.get("documentChanges").and_then(Value::as_array);
+            if changes.is_none() && document_changes.is_none() {
+                for value in object.values() {
+                    collect_workspace_edit_uris(value, uris);
+                }
+                return;
+            }
+            uris.extend(changes.into_iter().flat_map(|changes| changes.keys().cloned()));
+            for change in document_changes.into_iter().flatten() {
+                let fields = [
+                    &change["textDocument"]["uri"],
+                    &change["uri"],
+                    &change["oldUri"],
+                    &change["newUri"],
+                ];
+                uris.extend(fields.into_iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        Value::Array(array) => {
+            for value in array {
+                collect_workspace_edit_uris(value, uris);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Current disk text of a `file://` URI
+fn read_file_uri(uri: &str) -> Option<String> {
+    let path = crate::client::parse_root_uri(uri).ok()?;
+    std::fs::read_to_string(path).ok()
+}
+
+/// Is an edit of `uris`, caused by `client_id`'s commands in flight taken at
+/// `snapshots`, safe to apply in the client
+fn check_apply_edit<'s>(
+    docs: &Docs,
+    client_id: usize,
+    snapshots: impl IntoIterator<Item = &'s Snapshot>,
+    uris: &[String],
+    read: ReadUri,
+) -> Result<(), String> {
+    // The command which caused the edit is unknown with several of them in
+    // flight, the edit must be safe for all of them.
+    let mut any = false;
+    for snapshot in snapshots {
+        any = true;
+        for uri in uris {
+            docs.check_edit(client_id, snapshot, uri, read)?;
         }
     }
+    if !any {
+        return Err("no workspace/executeCommand in flight".into());
+    }
+    Ok(())
 }
 
-impl Deref for ClientData {
-    type Target = Client;
-
-    fn deref(&self) -> &Self::Target {
-        &self.client
+/// String key identifying a (tagged) request ID
+fn request_key(id: &RequestId) -> String {
+    match id {
+        RequestId::Number(number) => number.to_string(),
+        RequestId::String(string) => string.clone(),
     }
+}
+
+/// Successful response to `workspace/applyEdit` refusing the edit
+fn apply_edit_failure(id: RequestId, reason: &str) -> ResponseSuccess {
+    ResponseSuccess {
+        jsonrpc: Version,
+        result: json!({
+            "applied": false,
+            "failureReason": format!("lspmux: {reason}"),
+        }),
+        id,
+    }
+}
+
+/// JSON-RPC `ContentModified` error code
+const CONTENT_MODIFIED: i64 = -32801;
+
+fn content_modified(id: RequestId, message: &str) -> ResponseError {
+    ResponseError {
+        jsonrpc: Version,
+        error: jsonrpc::Error {
+            code: CONTENT_MODIFIED,
+            message: message.into(),
+            data: None,
+        },
+        id,
+    }
+}
+
+/// Message of the `ContentModified` error replacing results which may be
+/// based on another client's text
+const FOREIGN_TEXT: &str = "lspmux: result was computed against another client's document text";
+
+/// Server response to `client_id`'s request sent at `snapshot` in the client's
+/// document version numbering, or a `ContentModified` error when it may be
+/// based on text the client doesn't have
+fn response_for_client(
+    docs: &Docs,
+    client_id: usize,
+    snapshot: &Snapshot,
+    mut res: ResponseSuccess,
+    read: ReadUri,
+) -> Message {
+    if let Some(uri) = docs.foreign_switch_since(snapshot) {
+        warn!(?client_id, uri, "server switched to another client's text during the request");
+        return content_modified(res.id, FOREIGN_TEXT).into();
+    }
+    for uri in workspace_edit_uris(&res.result) {
+        if docs.has_open(client_id, &uri) {
+            continue;
+        }
+        if let Err(reason) = docs.check_not_open(client_id, &uri, read) {
+            warn!(?client_id, reason, "server response edits a document unsafe for the client");
+            return content_modified(res.id, FOREIGN_TEXT).into();
+        }
+    }
+    if docs.translate_versions(client_id, &mut res.result) {
+        res.into()
+    } else {
+        warn!(?client_id, "server response unsafe for the client");
+        content_modified(
+            res.id,
+            "lspmux: result refers to a document version this client no longer has",
+        )
+        .into()
+    }
+}
+
+/// Server request for `client_id` in the client's document version numbering
+///
+/// When it refers to text the client no longer has the request must not reach
+/// the client, the error is the response for the server instead.
+fn request_for_client(docs: &Docs, client_id: usize, mut req: Request) -> Result<Request, Message> {
+    if docs.translate_versions(client_id, &mut req.params) {
+        return Ok(req);
+    }
+    Err(if req.method == "workspace/applyEdit" {
+        let reason = format!("edit targets a document version client {client_id} no longer has");
+        apply_edit_failure(req.id, &reason).into()
+    } else {
+        content_modified(
+            req.id,
+            "lspmux: request refers to a document version this client no longer has",
+        )
+        .into()
+    })
+}
+
+/// Params of a server message for every client it's safe for, in each
+/// client's document version numbering
+fn translated_for_each(
+    docs: &Docs,
+    clients: &HashMap<usize, Client>,
+    params: &Value,
+) -> Vec<(usize, Value)> {
+    clients
+        .keys()
+        .filter_map(|&client_id| {
+            let mut params = params.clone();
+            docs.translate_versions(client_id, &mut params)
+                .then_some((client_id, params))
+        })
+        .collect()
 }
 
 // Current unix timestamp with second precission
@@ -120,7 +376,8 @@ impl Instance {
 
     /// Add client to the instance so it can receive traffic from it
     ///
-    /// It replays all registered dynamic capabilities to it.
+    /// It replays all registered dynamic capabilities and all cached
+    /// diagnostics to it.
     pub async fn add_client(&self, client: Client) {
         let mut clients = self.clients.lock().await;
         let dyn_capabilities = self.dynamic_capabilities.lock().await;
@@ -143,10 +400,12 @@ impl Instance {
             let _ = client.send_message(req.into()).await;
         }
 
-        let client = ClientData {
-            client,
-            files: HashSet::new(),
-        };
+        let diagnostics = self.docs.lock().await.replay_diagnostics();
+        debug!(count = diagnostics.len(), "replaying cached diagnostics");
+        for notif in diagnostics {
+            let _ = client.send_message(notif.into()).await;
+        }
+
         if clients.insert(client.id(), client).is_some() {
             unreachable!("BUG: added two clients with the same ID");
         }
@@ -157,21 +416,100 @@ impl Instance {
         debug!("cleaning up client");
 
         let mut clients = self.clients.lock().await;
+        let removed = clients.remove(&client.id());
 
-        let Some(client) = clients.remove(&client.id()) else {
+        {
+            let mut docs = self.docs.lock().await;
+            for notif in docs.close_client(client.id()).to_server {
+                debug!(?notif, "client disconnected, syncing server documents");
+                let _ = self.send_message(notif.into()).await;
+            }
+
+            // Commands keep their entry until the server responds so a
+            // request they cause can't be misrouted to another client.
+            let mut execute_commands = self.execute_commands.lock().await;
+            for command in &mut execute_commands.in_flight {
+                if command.client_id == client.id() {
+                    command.orphaned = true;
+                }
+            }
+        }
+
+        if removed.is_none() {
             // TODO This happens for example when the language server died while
             // client was still connected, and the client cleanup is attempted
             // with the instance being gone already. We should try notifying
             // these clients immediately and handling the cleanup separately.
             bail!("client was not connected");
-        };
-
-        let files = client.files.into_iter().collect::<Vec<_>>();
-        self.close_all_files(&clients, files)
-            .await
-            .context("error closing files")?;
+        }
 
         Ok(())
+    }
+
+    /// Forward a client request (with an already tagged ID) to the server
+    ///
+    /// First makes the server see the client's text of all documents it has
+    /// open, the resync, the snapshot of the client's documents and the
+    /// request all happen under one `docs` lock.
+    pub async fn forward_request(
+        &self,
+        client_id: usize,
+        req: Request,
+    ) -> Result<(), SendError<Message>> {
+        let mut docs = self.docs.lock().await;
+        for notif in docs.sync_for_request(client_id, &req.params) {
+            debug!(?notif, "syncing server document to requesting client");
+            self.send_message(notif.into()).await?;
+        }
+        // Recorded before sending so the response can't overtake it.
+        let key = request_key(&req.id);
+        let snapshot = docs.snapshot(client_id);
+        if req.method == "workspace/executeCommand" {
+            // Remember who triggered the command so server requests it causes
+            // can be routed back and checked against the client's documents.
+            self.execute_commands
+                .lock()
+                .await
+                .in_flight
+                .push(InFlightCommand {
+                    key: key.clone(),
+                    client_id,
+                    orphaned: false,
+                    snapshot: snapshot.clone(),
+                });
+        }
+        self.request_snapshots.lock().await.insert(key, snapshot);
+        self.send_message(req.into()).await
+    }
+
+    /// Remove the snapshot of a client request the server responded to
+    async fn take_request_snapshot(&self, id: &RequestId) -> Snapshot {
+        self.request_snapshots
+            .lock()
+            .await
+            .remove(&request_key(id))
+            .unwrap_or_default()
+    }
+
+    /// Forward a client notification to the server, ordered with document sync
+    pub async fn forward_notification(
+        &self,
+        notif: Notification,
+    ) -> Result<(), SendError<Message>> {
+        let _docs = self.docs.lock().await;
+        self.send_message(notif.into()).await
+    }
+
+    /// Forget a tracked `workspace/executeCommand` request after the server responded
+    async fn finish_execute_command(&self, id: &RequestId) {
+        let mut execute_commands = self.execute_commands.lock().await;
+        if execute_commands.in_flight.is_empty() {
+            return;
+        }
+        let key = request_key(id);
+        execute_commands
+            .in_flight
+            .retain(|command| command.key != key);
     }
 
     /// Send a message to the language server channel
@@ -205,102 +543,59 @@ impl Instance {
         Ok(())
     }
 
-    /// Handle `textDocument/didOpen` client notification
-    pub async fn open_file(&self, client_id: usize, params: Value) -> Result<()> {
-        let params = serde_json::from_value::<lsp::DidOpenTextDocumentParams>(params)
-            .context("parsing params")?;
-        let uri = &params.text_document.uri;
-
-        let mut send_notification = true;
-
-        let mut clients = self.clients.lock().await;
-        for client in clients.values() {
-            if client.files.contains(uri) {
-                debug!(?uri, "file is already opened by another client");
-                send_notification = false;
-                break;
-            }
-        }
-
-        clients
-            .get_mut(&client_id)
-            .expect("no matching client")
-            .files
-            .insert(uri.clone());
-
-        if send_notification {
-            let notif = Notification {
-                jsonrpc: Version,
-                method: "textDocument/didOpen".into(),
-                params: serde_json::to_value(params).unwrap(),
-            };
-            debug!(?notif, "first client opened file");
+    /// Send document sync notifications to the server
+    async fn send_effects(&self, effects: docs::Effects) -> Vec<Notification> {
+        for notif in effects.to_server {
+            debug!(?notif, "syncing server document");
             let _ = self.send_message(notif.into()).await;
         }
+        effects
+            .to_clients
+            .into_iter()
+            .map(|(_, notif)| notif)
+            .collect()
+    }
 
+    /// Handle `textDocument/didOpen` client notification
+    ///
+    /// Returns diagnostics the client should receive.
+    pub async fn open_file(&self, client_id: usize, params: Value) -> Result<Vec<Notification>> {
+        let mut docs = self.docs.lock().await;
+        let effects = docs.did_open(client_id, &params)?;
+        Ok(self.send_effects(effects).await)
+    }
+
+    /// Handle `textDocument/didChange` client notification
+    pub async fn change_file(&self, client_id: usize, params: Value) -> Result<()> {
+        let mut docs = self.docs.lock().await;
+        let effects = docs.did_change(client_id, &params)?;
+        self.send_effects(effects).await;
         Ok(())
     }
 
     /// Handle `textDocument/didClose` client notification
     pub async fn close_file(&self, client_id: usize, params: Value) -> Result<()> {
-        let params = serde_json::from_value::<lsp::DidCloseTextDocumentParams>(params)
-            .context("parsing params")?;
-
-        let mut clients = self.clients.lock().await;
-
-        clients
-            .get_mut(&client_id)
-            .context("no matching client")?
-            .files
-            .remove(&params.text_document.uri);
-
-        self.close_all_files(&clients, vec![params.text_document.uri])
-            .await
-    }
-
-    /// Handle closing many files at once and sending notifications for
-    /// definitely closed files
-    async fn close_all_files(
-        &self,
-        clients: &HashMap<usize, ClientData>,
-        files: Vec<String>,
-    ) -> Result<()> {
-        for uri in files {
-            let mut send_notification = true;
-
-            for client in clients.values() {
-                if client.files.contains(&uri) {
-                    debug!(?uri, "file still opened by another client");
-                    send_notification = false;
-                    break;
-                }
-            }
-
-            if send_notification {
-                let params = lsp::DidCloseTextDocumentParams {
-                    text_document: lsp::TextDocumentIdentifier { uri },
-                };
-                let notif = Notification {
-                    jsonrpc: Version,
-                    method: "textDocument/didClose".into(),
-                    params: serde_json::to_value(params).unwrap(),
-                };
-                debug!(?notif, "last client closed file");
-                let _ = self.send_message(notif.into()).await;
-            }
-        }
-
+        let uri = params["textDocument"]["uri"]
+            .as_str()
+            .context("missing textDocument.uri")?;
+        let mut docs = self.docs.lock().await;
+        let effects = docs.did_close(client_id, uri);
+        self.send_effects(effects).await;
         Ok(())
     }
 
     async fn get_status(&self) -> ext::Instance {
-        let clients = self
-            .clients
-            .lock()
-            .await
-            .values()
-            .map(|client| client.get_status())
-            .collect();
+        let clients = {
+            let clients = self.clients.lock().await;
+            let docs = self.docs.lock().await;
+            clients
+                .keys()
+                .map(|&id| ext::Client {
+                    id,
+                    files: docs.files_of(id),
+                })
+                .collect()
+        };
 
         let registered_dyn_capabilities = self
             .dynamic_capabilities
@@ -465,11 +760,18 @@ async fn spawn(
     let stdin = child.stdin.take().unwrap();
     let mut writer = LspWriter::new(stdin, "server");
 
-    let init_result = initialize_handshake(init_req_params, &mut reader, &mut writer)
+    let workspace_folders = initial_workspace_folders(&init_req_params);
+
+    let mut init_result = initialize_handshake(init_req_params, &mut reader, &mut writer)
         .await
         .context("server handshake")?;
 
     info!("initialized server");
+
+    // Clients send us full text changes, we keep their copies and decide
+    // what the server sees.
+    let encoding = PositionEncoding::from_server_capabilities(&init_result.capabilities);
+    docs::rewrite_text_document_sync(&mut init_result.capabilities);
 
     let (message_writer, rx) = mpsc::channel(64);
 
@@ -477,9 +779,13 @@ async fn spawn(
         key,
         pid,
         init_result,
+        workspace_folders,
         server: message_writer,
         clients: Mutex::default(),
         dynamic_capabilities: Mutex::default(),
+        docs: Mutex::new(Docs::new(encoding)),
+        request_snapshots: Mutex::default(),
+        execute_commands: Mutex::default(),
         close: Notify::new(),
         last_used: AtomicI64::new(utc_now()),
     });
@@ -635,6 +941,24 @@ async fn wait_task(
     }
 }
 
+/// Workspace folders the server is initialized with, as the
+/// `workspace/workspaceFolders` result
+///
+/// Falls back to a single folder from the deprecated `rootUri` and `null`
+/// (no workspace) when neither is present.
+fn initial_workspace_folders(params: &lsp::InitializeParams) -> Value {
+    if !params.workspace_folders.is_empty() {
+        return serde_json::to_value(&params.workspace_folders).unwrap();
+    }
+    match &params.root_uri {
+        Some(uri) => {
+            let name = uri.trim_end_matches('/').rsplit('/').next().unwrap_or(uri);
+            json!([{ "uri": uri, "name": name }])
+        }
+        None => Value::Null,
+    }
+}
+
 /// Read messages from server stdout and send them to corresponding client channels
 async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<ChildStdout>>) {
     loop {
@@ -658,9 +982,20 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 // Request ID tag.
                 match res.id.untag() {
                     (Some(Tag::ClientId(client_id)), id) => {
+                        let snapshot = instance.take_request_snapshot(&res.id).await;
+                        instance.finish_execute_command(&res.id).await;
                         res.id = id;
+                        // Must be based on the client's text, document
+                        // versions must be in the client's numbering
+                        let res = response_for_client(
+                            &*instance.docs.lock().await,
+                            client_id,
+                            &snapshot,
+                            res,
+                            &read_file_uri,
+                        );
                         if let Some(client) = clients.get(&client_id) {
-                            let _ = client.send_message(res.into()).await;
+                            let _ = client.send_message(res).await;
                         } else {
                             debug!(?client_id, "no matching client");
                         }
@@ -680,6 +1015,8 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 match res.id.untag() {
                     (Some(Tag::ClientId(client_id)), id) => {
                         warn!(?res, "server responded with error");
+                        instance.take_request_snapshot(&res.id).await;
+                        instance.finish_execute_command(&res.id).await;
                         res.id = id;
                         if let Some(client) = clients.get(&client_id) {
                             let _ = client.send_message(res.into()).await;
@@ -716,8 +1053,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 let id = req.id;
                 req.id = id.tag(Tag::Drop);
 
-                for client in clients.values() {
-                    let _ = client.send_message(req.clone().into()).await;
+                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
+                for (client_id, params) in deliveries {
+                    let req = Request { params, ..req.clone() };
+                    let _ = clients[&client_id].send_message(req.into()).await;
                 }
 
                 let _ = instance
@@ -725,15 +1064,22 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     .await;
             }
 
-            Message::Request(mut req) if req.method == "workspace/configuration" => {
+            Message::Request(req) if req.method == "workspace/configuration" => {
                 // Response to `workspace/configuration` should be the same from
                 // any client. So we'll just pick the first and let it answer.
                 debug!(?req, "server request workspace/configuration");
 
-                req.id = req.id.tag(Tag::Forward);
-
                 if let Some(client) = clients.values().next() {
-                    let _ = client.send_message(req.into()).await;
+                    match request_for_client(&*instance.docs.lock().await, client.id(), req) {
+                        Ok(mut req) => {
+                            req.id = req.id.tag(Tag::Forward);
+                            let _ = client.send_message(req.into()).await;
+                        }
+                        Err(reply) => {
+                            warn!(?reply, "server request unsafe for the client");
+                            let _ = instance.send_message(reply).await;
+                        }
+                    }
                 } else {
                     // If there is no client connected at this moment we'll
                     // ignore the request.
@@ -750,8 +1096,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 let id = req.id;
                 req.id = id.tag(Tag::Drop);
 
-                for client in clients.values() {
-                    let _ = client.send_message(req.clone().into()).await;
+                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
+                for (client_id, params) in deliveries {
+                    let req = Request { params, ..req.clone() };
+                    let _ = clients[&client_id].send_message(req.into()).await;
                 }
 
                 // We need to cache the dynamic capabilities registrations for
@@ -775,8 +1123,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 let id = req.id;
                 req.id = id.tag(Tag::Drop);
 
-                for client in clients.values() {
-                    let _ = client.send_message(req.clone().into()).await;
+                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
+                for (client_id, params) in deliveries {
+                    let req = Request { params, ..req.clone() };
+                    let _ = clients[&client_id].send_message(req.into()).await;
                 }
 
                 // We need to remove this registration from the cache so we
@@ -790,20 +1140,490 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     .await;
             }
 
+            Message::Request(req) if req.method == "workspace/applyEdit" => {
+                // The edit must be applied exactly once, by the client whose
+                // `workspace/executeCommand` caused it. When that's ambiguous
+                // or the edit may be based on text the client doesn't have we
+                // refuse it instead of guessing. The client response is
+                // forwarded back to the server.
+                debug!(?req, "server request workspace/applyEdit");
+
+                let routed = {
+                    let docs = instance.docs.lock().await;
+                    let execute_commands = instance.execute_commands.lock().await;
+                    let owners = execute_commands.owners();
+                    let uris = workspace_edit_uris(&req.params["edit"]);
+                    let selected = select_request_owner(&owners)
+                        .and_then(|client_id| {
+                            clients
+                                .get(&client_id)
+                                .map(|client| (client_id, client))
+                                .ok_or("the client which triggered the request disconnected")
+                        });
+                    match selected {
+                        Ok((client_id, client)) => check_apply_edit(
+                            &docs,
+                            client_id,
+                            execute_commands.snapshots_of(client_id),
+                            &uris,
+                            &read_file_uri,
+                        )
+                        .map_err(|reason| Message::from(apply_edit_failure(req.id.clone(), &reason)))
+                        .and_then(|()| request_for_client(&docs, client_id, req))
+                        .map(|req| (client_id, client, req)),
+                        Err(reason) => Err(apply_edit_failure(req.id, reason).into()),
+                    }
+                };
+
+                match routed {
+                    Ok((client_id, client, mut req)) => {
+                        debug!(?client_id, "forwarding workspace/applyEdit to the client which triggered it");
+                        req.id = req.id.tag(Tag::Forward);
+                        let _ = client.send_message(req.into()).await;
+                    }
+                    Err(reply) => {
+                        warn!(?reply, "rejecting workspace/applyEdit");
+                        let _ = instance.send_message(reply).await;
+                    }
+                }
+            }
+
+            Message::Request(req) if req.method == "workspace/workspaceFolders" => {
+                // We know what the instance was initialized with, answer
+                // ourselves.
+                debug!(?req, "server request workspace/workspaceFolders");
+                let res = ResponseSuccess {
+                    jsonrpc: Version,
+                    result: instance.workspace_folders.clone(),
+                    id: req.id,
+                };
+                let _ = instance.send_message(res.into()).await;
+            }
+
+            Message::Request(req)
+                if req.method == "window/showDocument"
+                    || req.method == "window/showMessageRequest" =>
+            {
+                // Only the client whose command caused these can answer them.
+                debug!(?req, "server request {}", req.method.as_str());
+
+                let owner = {
+                    let owners = instance.execute_commands.lock().await.owners();
+                    select_request_owner(&owners).and_then(|client_id| {
+                        clients
+                            .get(&client_id)
+                            .map(|client| (client_id, client))
+                            .ok_or("the client which triggered the request disconnected")
+                    })
+                };
+
+                match owner {
+                    Ok((client_id, client)) => {
+                        match request_for_client(&*instance.docs.lock().await, client_id, req) {
+                            Ok(mut req) => {
+                                debug!(?client_id, "forwarding {} to the client which triggered it", req.method);
+                                req.id = req.id.tag(Tag::Forward);
+                                let _ = client.send_message(req.into()).await;
+                            }
+                            Err(reply) => {
+                                warn!(?reply, "server request unsafe for the client");
+                                let _ = instance.send_message(reply).await;
+                            }
+                        }
+                    }
+                    Err(reason) if req.method == "window/showDocument" => {
+                        warn!(reason, "rejecting window/showDocument");
+                        let res = ResponseSuccess {
+                            jsonrpc: Version,
+                            result: json!({ "success": false }),
+                            id: req.id,
+                        };
+                        let _ = instance.send_message(res.into()).await;
+                    }
+                    Err(reason) => {
+                        // Show the message to everyone, nobody gets to pick
+                        // an action.
+                        debug!(reason, "broadcasting window/showMessageRequest as window/showMessage");
+                        let notif = Notification {
+                            jsonrpc: Version,
+                            method: "window/showMessage".into(),
+                            params: json!({
+                                "type": req.params["type"],
+                                "message": req.params["message"],
+                            }),
+                        };
+                        for client in clients.values() {
+                            let _ = client.send_message(notif.clone().into()).await;
+                        }
+                        let _ = instance
+                            .send_message(ResponseSuccess::null(req.id).into())
+                            .await;
+                    }
+                }
+            }
+
             Message::Request(req) => {
-                // Unimplemented server -> client requests I've found in the LSP Spec.
-                // TODO workspace/workspaceFolders request
-                // TODO workspace/applyEdit request
-                debug!(message = ?req, "ignoring unknown server request");
+                // Answer instead of leaving the server waiting forever.
+                warn!(?req, "unsupported server request");
+                let res = ResponseError {
+                    jsonrpc: Version,
+                    error: jsonrpc::Error {
+                        code: -32601,
+                        message: format!("lspmux: unsupported server request {}", req.method),
+                        data: None,
+                    },
+                    id: req.id,
+                };
+                let _ = instance.send_message(res.into()).await;
+            }
+
+            Message::Notification(notif) if notif.method == "textDocument/publishDiagnostics" => {
+                // Cache them for clients connecting or opening the document
+                // later and only show them to clients with matching text.
+                let deliveries = {
+                    let connected = clients.keys().copied().collect::<Vec<_>>();
+                    let mut docs = instance.docs.lock().await;
+                    docs.publish_diagnostics(notif.params, &connected)
+                };
+                for (client_id, notif) in deliveries {
+                    let _ = clients[&client_id].send_message(notif.into()).await;
+                }
             }
 
             Message::Notification(notif) => {
                 // Server notifications don't expect a response. We can forward
-                // them to all clients.
-                for client in clients.values() {
-                    let _ = client.send_message(notif.clone().into()).await;
+                // them to all clients, except those they're unsafe for.
+                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &notif.params);
+                for (client_id, params) in deliveries {
+                    let notif = Notification { params, ..notif.clone() };
+                    let _ = clients[&client_id].send_message(notif.into()).await;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: usize = 1;
+    const B: usize = 2;
+
+    fn owner(client_id: usize) -> Owner {
+        Owner {
+            client_id,
+            orphaned: false,
+        }
+    }
+
+    fn orphan(client_id: usize) -> Owner {
+        Owner {
+            client_id,
+            orphaned: true,
+        }
+    }
+
+    #[test]
+    fn routing_single_connected_owner() {
+        assert_eq!(select_request_owner(&[owner(A)]), Ok(A));
+    }
+
+    #[test]
+    fn routing_several_owners_is_ambiguous() {
+        // A's and B's commands are both in flight and an edit arrives which
+        // touches a file only B has open. A's command may legitimately edit a
+        // file A doesn't have open, so open documents don't establish
+        // ownership: neither client may receive it.
+        let tracker = ExecuteCommandTracker {
+            in_flight: vec![
+                InFlightCommand {
+                    key: "1".into(),
+                    client_id: A,
+                    orphaned: false,
+                    snapshot: Snapshot::default(),
+                },
+                InFlightCommand {
+                    key: "2".into(),
+                    client_id: B,
+                    orphaned: false,
+                    snapshot: Snapshot::default(),
+                },
+            ],
+        };
+        assert!(select_request_owner(&tracker.owners()).is_err());
+        // arrival order doesn't matter either
+        assert!(select_request_owner(&[owner(B), owner(A)]).is_err());
+    }
+
+    #[test]
+    fn routing_fails_closed() {
+        // sole owner orphaned
+        assert!(select_request_owner(&[orphan(A)]).is_err());
+        // orphan plus a connected owner
+        assert!(select_request_owner(&[orphan(A), owner(B)]).is_err());
+        // no owner
+        assert!(select_request_owner(&[]).is_err());
+    }
+
+    #[test]
+    fn tracker_owners_survive_disconnect() {
+        let command = |key: &str, client_id, orphaned| InFlightCommand {
+            key: key.into(),
+            client_id,
+            orphaned,
+            snapshot: Snapshot::default(),
+        };
+        let tracker = ExecuteCommandTracker {
+            in_flight: vec![command("1", A, false), command("2", B, true), command("3", A, false)],
+        };
+        assert_eq!(tracker.owners(), [owner(A), orphan(B)]);
+    }
+
+    #[test]
+    fn edited_uris() {
+        let edit = json!({
+            "changes": { "file:///a": [] },
+            "documentChanges": [
+                { "textDocument": { "uri": "file:///b", "version": 1 }, "edits": [] },
+                { "kind": "create", "uri": "file:///c" },
+                { "kind": "rename", "oldUri": "file:///d", "newUri": "file:///e" },
+                { "kind": "delete", "uri": "file:///f" },
+            ],
+        });
+        assert_eq!(
+            workspace_edit_uris(&edit),
+            ["file:///a", "file:///b", "file:///c", "file:///d", "file:///e", "file:///f"]
+        );
+
+        // WorkspaceEdits nested in results, e.g. code actions
+        let actions = json!([
+            { "title": "x", "edit": { "changes": { "file:///g": [] } } },
+            { "title": "y", "command": { "command": "c", "arguments": [{ "changes": "not a map" }] } },
+            { "title": "z", "edit": { "documentChanges": [{ "textDocument": { "uri": "file:///h", "version": null }, "edits": [] }] } },
+        ]);
+        assert_eq!(workspace_edit_uris(&actions), ["file:///g", "file:///h"]);
+        // applyEdit params
+        assert_eq!(
+            workspace_edit_uris(&json!({ "label": "l", "edit": { "changes": { "file:///i": [] } } })),
+            ["file:///i"]
+        );
+    }
+
+    const U: &str = "file:///p/A.hs";
+
+    /// Client A (version 10) and B (version 20) diverged, server at version 2
+    /// with B's text, A matched server version 1
+    fn diverged_docs() -> Docs {
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        let open = |version: i64, text: &str| {
+            json!({ "textDocument": { "uri": U, "languageId": "haskell", "version": version, "text": text } })
+        };
+        docs.did_open(A, &open(10, "a")).unwrap();
+        docs.did_open(B, &open(20, "b")).unwrap();
+        docs
+    }
+
+    fn apply_edit(version: i64) -> Request {
+        Request {
+            jsonrpc: Version,
+            method: "workspace/applyEdit".into(),
+            params: json!({ "edit": { "documentChanges": [
+                { "textDocument": { "uri": U, "version": version }, "edits": [] },
+            ] } }),
+            id: RequestId::Number(7),
+        }
+    }
+
+    #[test]
+    fn apply_edit_with_unsafe_version_is_refused() {
+        let mut docs = diverged_docs();
+        // A changed since server version 1
+        docs.did_change(
+            A,
+            &json!({ "textDocument": { "uri": U, "version": 11 }, "contentChanges": [{ "text": "aa" }] }),
+        )
+        .unwrap();
+        docs.sync_for_request(B, &json!({}));
+
+        let reply = request_for_client(&docs, B, apply_edit(1)).err().unwrap();
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({ "jsonrpc": "2.0", "id": 7, "result": {
+                "applied": false,
+                "failureReason": format!("lspmux: edit targets a document version client {B} no longer has"),
+            } })
+        );
+
+        // A's edit for server version 1 is unsafe too, it changed since
+        assert!(request_for_client(&docs, A, apply_edit(1)).is_err());
+        // B's text is the server's current one (version 4 after the resyncs)
+        let req = request_for_client(&docs, B, apply_edit(4)).ok().unwrap();
+        assert_eq!(
+            req.params["edit"]["documentChanges"][0]["textDocument"]["version"],
+            20
+        );
+    }
+
+    #[test]
+    fn apply_edit_with_older_matched_version_is_forwarded() {
+        let docs = diverged_docs();
+        // A didn't change since the server had its text at version 1
+        let req = request_for_client(&docs, A, apply_edit(1)).ok().unwrap();
+        assert_eq!(
+            req.params["edit"]["documentChanges"][0]["textDocument"]["version"],
+            10
+        );
+    }
+
+    #[test]
+    fn response_with_unsafe_version_becomes_content_modified() {
+        let docs = diverged_docs();
+        let res = |version: i64| ResponseSuccess {
+            jsonrpc: Version,
+            result: json!([{ "textDocument": { "uri": U, "version": version } }]),
+            id: RequestId::Number(3),
+        };
+
+        let unsafe_res =
+            serde_json::to_value(response_for_client(&docs, A, &Snapshot::default(), res(2), &no_disk))
+                .unwrap();
+        assert_eq!(
+            unsafe_res,
+            json!({ "jsonrpc": "2.0", "id": 3, "error": {
+                "code": -32801,
+                "message": "lspmux: result refers to a document version this client no longer has",
+            } })
+        );
+
+        let safe_res =
+            serde_json::to_value(response_for_client(&docs, B, &Snapshot::default(), res(2), &no_disk))
+                .unwrap();
+        assert_eq!(safe_res["result"][0]["textDocument"]["version"], 20);
+    }
+
+    fn no_disk(_: &str) -> Option<String> {
+        panic!("no disk access expected")
+    }
+
+    fn open(uri: &str, version: i64, text: &str) -> Value {
+        json!({ "textDocument": { "uri": uri, "languageId": "haskell", "version": version, "text": text } })
+    }
+
+    fn change(uri: &str, version: i64, text: &str) -> Value {
+        json!({ "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] })
+    }
+
+    #[test]
+    fn unversioned_apply_edit_checked_against_command_snapshot() {
+        let uris = [U.to_owned()];
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(A, &open(U, 1, "a")).unwrap();
+        docs.did_open(B, &open(U, 1, "a")).unwrap();
+        let snapshot = docs.snapshot(A);
+
+        // unchanged
+        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        // no command in flight
+        assert!(check_apply_edit(&docs, A, [], &uris, &no_disk).is_err());
+
+        // A's own edit during the command
+        docs.did_change(A, &change(U, 2, "a2")).unwrap();
+        let err = check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk).unwrap_err();
+        assert!(err.contains("changed by the client"), "{err}");
+
+        // B switches the server to its text during the command
+        let snapshot = docs.snapshot(A);
+        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        docs.did_change(B, &change(U, 2, "b")).unwrap();
+        let err = check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk).unwrap_err();
+        assert!(err.contains("another client's text"), "{err}");
+        let reply = serde_json::to_value(apply_edit_failure(RequestId::Number(7), &err)).unwrap();
+        assert_eq!(reply["result"]["applied"], false);
+        assert!(reply["result"]["failureReason"].as_str().unwrap().starts_with("lspmux: "));
+
+        // with several commands in flight every snapshot must be safe
+        let newer = docs.snapshot(A);
+        assert_eq!(check_apply_edit(&docs, A, [&newer], &uris, &no_disk), Ok(()));
+        assert!(check_apply_edit(&docs, A, [&snapshot, &newer], &uris, &no_disk).is_err());
+    }
+
+    #[test]
+    fn unversioned_apply_edit_of_document_not_open_in_client() {
+        const O: &str = "file:///p/Other.hs";
+        let uris = [O.to_owned()];
+        let disk = |uri: &str| (uri == O).then(|| "on disk".to_owned());
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(A, &open(U, 1, "a")).unwrap();
+        let snapshot = docs.snapshot(A);
+
+        // nobody has it open
+        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        // B has it open with the disk text
+        docs.did_open(B, &open(O, 1, "on disk")).unwrap();
+        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &disk), Ok(()));
+        // B's text differs from disk
+        docs.did_change(B, &change(O, 2, "unsaved")).unwrap();
+        let err = check_apply_edit(&docs, A, [&snapshot], &uris, &disk).unwrap_err();
+        assert!(err.contains("differs from disk"), "{err}");
+    }
+
+    fn code_action(uri: &str) -> ResponseSuccess {
+        ResponseSuccess {
+            jsonrpc: Version,
+            result: json!([{ "title": "t", "edit": { "changes": { uri: [] } } }]),
+            id: RequestId::Number(3),
+        }
+    }
+
+    fn is_foreign_text_error(message: &Message) -> bool {
+        serde_json::to_value(message).unwrap()["error"]
+            == json!({ "code": -32801, "message": FOREIGN_TEXT })
+    }
+
+    #[test]
+    fn response_checked_against_request_snapshot() {
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(A, &open(U, 1, "a")).unwrap();
+        docs.did_open(B, &open(U, 1, "a")).unwrap();
+
+        // unchanged
+        let snapshot = docs.snapshot(A);
+        let res = response_for_client(&docs, A, &snapshot, code_action(U), &no_disk);
+        assert!(matches!(res, Message::ResponseSuccess(_)));
+
+        // A's own edit doesn't reject a response
+        docs.did_change(A, &change(U, 2, "a2")).unwrap();
+        let res = response_for_client(&docs, A, &snapshot, code_action(U), &no_disk);
+        assert!(matches!(res, Message::ResponseSuccess(_)));
+
+        // B switching the server to its text does, for any response
+        let snapshot = docs.snapshot(A);
+        docs.did_change(B, &change(U, 2, "b")).unwrap();
+        let res = response_for_client(&docs, A, &snapshot, code_action(U), &no_disk);
+        assert!(is_foreign_text_error(&res));
+        let plain = ResponseSuccess::null(RequestId::Number(3));
+        assert!(is_foreign_text_error(&response_for_client(&docs, A, &snapshot, plain, &no_disk)));
+    }
+
+    #[test]
+    fn response_editing_document_open_in_another_client() {
+        const O: &str = "file:///p/Other.hs";
+        let disk = |uri: &str| (uri == O).then(|| "on disk".to_owned());
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(A, &open(U, 1, "a")).unwrap();
+        let snapshot = docs.snapshot(A);
+
+        // nobody has it open
+        let res = response_for_client(&docs, A, &snapshot, code_action(O), &no_disk);
+        assert!(matches!(res, Message::ResponseSuccess(_)));
+        // B has the disk text open
+        docs.did_open(B, &open(O, 1, "on disk")).unwrap();
+        let res = response_for_client(&docs, A, &snapshot, code_action(O), &disk);
+        assert!(matches!(res, Message::ResponseSuccess(_)));
+        // B's text differs from disk
+        docs.did_change(B, &change(O, 2, "unsaved")).unwrap();
+        let res = response_for_client(&docs, A, &snapshot, code_action(O), &disk);
+        assert!(is_foreign_text_error(&res));
     }
 }
