@@ -176,6 +176,9 @@ pub struct Instance {
 #[serde(rename_all = "camelCase")]
 pub struct Client {
     pub id: usize,
+    /// `clientInfo.name` from the client's `initialize` request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub files: Vec<String>,
 }
 

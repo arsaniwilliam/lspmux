@@ -6,8 +6,8 @@ use std::ops::Deref;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -15,9 +15,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::MissedTickBehavior;
 use tokio::{select, task};
 use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
+use crate::capabilities::{self, refresh_capability, Registrations, REFRESH_REQUESTS};
 use crate::client::Client;
 use crate::config::Config;
 use crate::docs::{self, Docs, PositionEncoding, ReadUri, Snapshot};
@@ -27,6 +29,8 @@ use crate::lsp::jsonrpc::{
 };
 use crate::lsp::transport::{LspReader, LspWriter};
 use crate::lsp::{self, ext};
+use crate::progress::Progress;
+use crate::settings;
 
 /// Specifies server configuration
 ///
@@ -46,8 +50,8 @@ pub struct InstanceKey {
 /// When more than one of the mutexes is held at the same time they must be
 /// acquired in this order (any subset, skipping is fine):
 ///
-/// `clients` → `dynamic_capabilities` → `docs` → `request_snapshots` →
-/// `execute_commands`
+/// `clients` → `dynamic_capabilities` → `docs` → `progress` →
+/// `request_snapshots` → `execute_commands`
 ///
 /// `docs` is held across sends into the server channel so client document
 /// resyncs and the request they're for reach the server without other
@@ -71,11 +75,23 @@ pub struct Instance {
     /// Associated clients
     clients: Mutex<HashMap<usize, Client>>,
 
-    /// Dynamic capabilities registered by the server
-    dynamic_capabilities: Mutex<HashMap<String, lsp::Registration>>,
+    /// Dynamic capabilities registered by the server and which clients
+    /// received them
+    dynamic_capabilities: Mutex<Registrations>,
 
     /// Client and server copies of open documents and cached diagnostics
     docs: Mutex<Docs>,
+
+    /// Active server progress and when the server was last active
+    progress: Mutex<Progress>,
+
+    /// How long the server must be quiet before owed diagnostics are
+    /// answered by lspmux
+    settle: Duration,
+
+    /// Settings object lspmux answers `workspace/configuration` with instead
+    /// of the clients, from `server_settings`
+    settings: Option<Value>,
 
     /// Document state of each client request the server hasn't responded to
     /// yet, at the time it was sent, keyed by the tagged request ID
@@ -193,7 +209,11 @@ fn collect_workspace_edit_uris(value: &Value, uris: &mut Vec<String>) {
                 }
                 return;
             }
-            uris.extend(changes.into_iter().flat_map(|changes| changes.keys().cloned()));
+            uris.extend(
+                changes
+                    .into_iter()
+                    .flat_map(|changes| changes.keys().cloned()),
+            );
             for change in document_changes.into_iter().flatten() {
                 let fields = [
                     &change["textDocument"]["uri"],
@@ -201,7 +221,12 @@ fn collect_workspace_edit_uris(value: &Value, uris: &mut Vec<String>) {
                     &change["oldUri"],
                     &change["newUri"],
                 ];
-                uris.extend(fields.into_iter().filter_map(Value::as_str).map(str::to_owned));
+                uris.extend(
+                    fields
+                        .into_iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                );
             }
         }
         Value::Array(array) => {
@@ -293,7 +318,10 @@ fn response_for_client(
     read: ReadUri,
 ) -> Message {
     if let Some(uri) = docs.foreign_switch_since(snapshot) {
-        warn!(?client_id, uri, "server switched to another client's text during the request");
+        warn!(
+            ?client_id,
+            uri, "server switched to another client's text during the request"
+        );
         return content_modified(res.id, FOREIGN_TEXT).into();
     }
     for uri in workspace_edit_uris(&res.result) {
@@ -301,7 +329,10 @@ fn response_for_client(
             continue;
         }
         if let Err(reason) = docs.check_not_open(client_id, &uri, read) {
-            warn!(?client_id, reason, "server response edits a document unsafe for the client");
+            warn!(
+                ?client_id,
+                reason, "server response edits a document unsafe for the client"
+            );
             return content_modified(res.id, FOREIGN_TEXT).into();
         }
     }
@@ -359,6 +390,19 @@ fn utc_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
+/// Diagnostics owed to clients, if the server settled
+fn owed_when_settled(
+    docs: &mut Docs,
+    progress: &Progress,
+    now: Instant,
+    settle: Duration,
+) -> Vec<(usize, Notification)> {
+    if !docs.any_owed() || !progress.settled(now, settle) {
+        return Vec::new();
+    }
+    docs.take_owed_diagnostics()
+}
+
 impl Instance {
     /// Mark the instance as used
     pub fn keep_alive(&self) {
@@ -374,22 +418,28 @@ impl Instance {
         self.init_result.clone()
     }
 
+    /// Does lspmux answer the server's configuration requests itself
+    pub fn owns_settings(&self) -> bool {
+        self.settings.is_some()
+    }
+
     /// Add client to the instance so it can receive traffic from it
     ///
-    /// It replays all registered dynamic capabilities and all cached
-    /// diagnostics to it.
+    /// It replays the registered dynamic capabilities the client supports,
+    /// all cached diagnostics and active progress to it.
     pub async fn add_client(&self, client: Client) {
         let mut clients = self.clients.lock().await;
-        let dyn_capabilities = self.dynamic_capabilities.lock().await;
 
-        if !dyn_capabilities.is_empty() {
-            // Register all currently cached dynamic capabilities if there are
-            // any. We will drop the client response and we need to make sure
-            // the request ID is unique.
+        let registrations = self
+            .dynamic_capabilities
+            .lock()
+            .await
+            .add_client(client.id(), client.record().clone());
+        if !registrations.is_empty() {
+            // We will drop the client response and we need to make sure the
+            // request ID is unique.
             let id = RequestId::String("replay:registerCapabilities".into()).tag(Tag::Drop);
-            let params = lsp::RegistrationParams {
-                registrations: dyn_capabilities.values().cloned().collect(),
-            };
+            let params = lsp::RegistrationParams { registrations };
             let req = Request {
                 id,
                 method: "client/registerCapability".into(),
@@ -406,6 +456,13 @@ impl Instance {
             let _ = client.send_message(notif.into()).await;
         }
 
+        let work_done_progress = client.record().declares("window.workDoneProgress");
+        let progress = self.progress.lock().await.attach(work_done_progress);
+        debug!(count = progress.len(), "replaying progress");
+        for message in progress {
+            let _ = client.send_message(message).await;
+        }
+
         if clients.insert(client.id(), client).is_some() {
             unreachable!("BUG: added two clients with the same ID");
         }
@@ -418,11 +475,16 @@ impl Instance {
         let mut clients = self.clients.lock().await;
         let removed = clients.remove(&client.id());
 
+        self.dynamic_capabilities
+            .lock()
+            .await
+            .remove_client(client.id());
+
         {
             let mut docs = self.docs.lock().await;
             for notif in docs.close_client(client.id()).to_server {
                 debug!(?notif, "client disconnected, syncing server documents");
-                let _ = self.send_message(notif.into()).await;
+                let _ = self.send_sync(notif).await;
             }
 
             // Commands keep their entry until the server responds so a
@@ -459,7 +521,7 @@ impl Instance {
         let mut docs = self.docs.lock().await;
         for notif in docs.sync_for_request(client_id, &req.params) {
             debug!(?notif, "syncing server document to requesting client");
-            self.send_message(notif.into()).await?;
+            self.send_sync(notif).await?;
         }
         // Recorded before sending so the response can't overtake it.
         let key = request_key(&req.id);
@@ -500,6 +562,15 @@ impl Instance {
         self.send_message(notif.into()).await
     }
 
+    /// Should `workspace/didChangeWatchedFiles` from `client_id` reach the
+    /// server
+    pub async fn forwards_watched_files_from(&self, client_id: usize) -> bool {
+        self.dynamic_capabilities
+            .lock()
+            .await
+            .forwards_watched_files_from(client_id)
+    }
+
     /// Forget a tracked `workspace/executeCommand` request after the server responded
     async fn finish_execute_command(&self, id: &RequestId) {
         let mut execute_commands = self.execute_commands.lock().await;
@@ -517,37 +588,25 @@ impl Instance {
         self.server.send(message).await
     }
 
-    /// Save registered capabilities to allow later replaying them to new clients
-    async fn register_capabilities(&self, params: Value) -> Result<()> {
-        let params =
-            serde_json::from_value::<lsp::RegistrationParams>(params).context("parsing params")?;
-
-        let mut dyn_capabilities = self.dynamic_capabilities.lock().await;
-        for reg in params.registrations {
-            dyn_capabilities.insert(reg.id.clone(), reg);
+    /// Send a document notification to the server
+    ///
+    /// Opens, changes and saves make the server recheck, possibly other
+    /// documents too, which delays settling.
+    async fn send_sync(&self, notif: Notification) -> Result<(), SendError<Message>> {
+        if matches!(
+            notif.method.as_str(),
+            "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave"
+        ) {
+            self.progress.lock().await.touch(Instant::now());
         }
-
-        Ok(())
-    }
-
-    /// Remove cached capability registration to stop replaying them to new clients
-    async fn unregister_capabilities(&self, params: Value) -> Result<()> {
-        let params = serde_json::from_value::<lsp::UnregistrationParams>(params)
-            .context("parsing params")?;
-
-        let mut dyn_capabilities = self.dynamic_capabilities.lock().await;
-        for unreg in params.unregistrations {
-            dyn_capabilities.remove(&unreg.id);
-        }
-
-        Ok(())
+        self.send_message(notif.into()).await
     }
 
     /// Send document sync notifications to the server
     async fn send_effects(&self, effects: docs::Effects) -> Vec<Notification> {
         for notif in effects.to_server {
             debug!(?notif, "syncing server document");
-            let _ = self.send_message(notif.into()).await;
+            let _ = self.send_sync(notif).await;
         }
         effects
             .to_clients
@@ -573,6 +632,19 @@ impl Instance {
         Ok(())
     }
 
+    /// Handle `textDocument/didSave` client notification, it's forwarded
+    pub async fn save_file(
+        &self,
+        client_id: usize,
+        notif: Notification,
+    ) -> Result<(), SendError<Message>> {
+        let mut docs = self.docs.lock().await;
+        if let Some(uri) = notif.params["textDocument"]["uri"].as_str() {
+            docs.did_save(client_id, uri);
+        }
+        self.send_sync(notif).await
+    }
+
     /// Handle `textDocument/didClose` client notification
     pub async fn close_file(&self, client_id: usize, params: Value) -> Result<()> {
         let uri = params["textDocument"]["uri"]
@@ -584,26 +656,41 @@ impl Instance {
         Ok(())
     }
 
+    /// Send owed diagnostics if the server settled
+    async fn answer_owed_diagnostics(&self) {
+        let clients = self.clients.lock().await;
+        let deliveries = {
+            let mut docs = self.docs.lock().await;
+            let progress = self.progress.lock().await;
+            owed_when_settled(&mut docs, &progress, Instant::now(), self.settle)
+        };
+        for (client_id, notif) in deliveries {
+            if let Some(client) = clients.get(&client_id) {
+                debug!(
+                    ?client_id,
+                    ?notif,
+                    "server settled, answering owed diagnostics"
+                );
+                let _ = client.send_message(notif.into()).await;
+            }
+        }
+    }
+
     async fn get_status(&self) -> ext::Instance {
         let clients = {
             let clients = self.clients.lock().await;
             let docs = self.docs.lock().await;
             clients
-                .keys()
-                .map(|&id| ext::Client {
-                    id,
-                    files: docs.files_of(id),
+                .values()
+                .map(|client| ext::Client {
+                    id: client.id(),
+                    name: client.record().name().map(str::to_owned),
+                    files: docs.files_of(client.id()),
                 })
                 .collect()
         };
 
-        let registered_dyn_capabilities = self
-            .dynamic_capabilities
-            .lock()
-            .await
-            .values()
-            .map(|reg| reg.method.clone())
-            .collect();
+        let registered_dyn_capabilities = self.dynamic_capabilities.lock().await.methods();
 
         ext::Instance {
             pid: self.pid,
@@ -618,11 +705,26 @@ impl Instance {
     }
 }
 
-pub struct InstanceMap(HashMap<InstanceKey, Arc<Instance>>);
+/// What instances take from the configuration
+struct InstanceOptions {
+    settle: Duration,
+    server_settings: BTreeMap<String, String>,
+}
+
+pub struct InstanceMap {
+    instances: HashMap<InstanceKey, Arc<Instance>>,
+    options: Arc<InstanceOptions>,
+}
 
 impl InstanceMap {
     pub fn new(config: &Config) -> Arc<Mutex<Self>> {
-        let instance_map = Arc::new(Mutex::new(InstanceMap(HashMap::new())));
+        let instance_map = Arc::new(Mutex::new(InstanceMap {
+            instances: HashMap::new(),
+            options: Arc::new(InstanceOptions {
+                settle: Duration::from_millis(config.settle_ms),
+                server_settings: config.server_settings.clone(),
+            }),
+        }));
         task::spawn(gc_task(
             instance_map.clone(),
             config.gc_interval,
@@ -634,7 +736,7 @@ impl InstanceMap {
     /// Finds an instance with the longest path such as
     /// `cwd.starts_with(workspace_root)` is true
     pub fn get_by_cwd(&self, cwd: &str) -> Option<&Instance> {
-        self.0
+        self.instances
             .iter()
             .filter(|(key, _)| Path::new(cwd).starts_with(&key.workspace_root))
             .max_by_key(|(key, _)| key.workspace_root.len())
@@ -642,8 +744,8 @@ impl InstanceMap {
     }
 
     pub async fn get_status(&self) -> ext::StatusResponse {
-        let mut instances = Vec::with_capacity(self.0.len());
-        for instance in self.0.values() {
+        let mut instances = Vec::with_capacity(self.instances.len());
+        for instance in self.instances.values() {
             instances.push(instance.get_status().await);
         }
         ext::StatusResponse { instances }
@@ -661,7 +763,7 @@ async fn gc_task(
     loop {
         interval.tick().await;
 
-        for (key, instance) in &instance_map.lock().await.0 {
+        for (key, instance) in &instance_map.lock().await.instances {
             let clients = instance.clients.lock().await;
 
             let idle = instance.idle();
@@ -694,13 +796,16 @@ pub async fn get_or_spawn(
     // doesn't try to lock its copy as well. This is a bit unfortunate code
     // organization but we want to have spawn in a separate tracing context and
     // we want to include `wait_task` in it as well in it as well
-    match map.clone().lock().await.0.entry(key.clone()) {
+    let map_ref = map.clone();
+    let mut locked = map_ref.lock().await;
+    let options = locked.options.clone();
+    match locked.instances.entry(key.clone()) {
         Entry::Occupied(e) => {
             info!("reusing language server instance");
             Ok(e.get().clone())
         }
         Entry::Vacant(e) => {
-            let instance = spawn(key, init_req_params, map)
+            let instance = spawn(key, init_req_params, &options, map)
                 .await
                 .context("spawning instance")?;
             e.insert(instance.clone());
@@ -712,7 +817,8 @@ pub async fn get_or_spawn(
 #[instrument(name = "instance", fields(pid = field::Empty), skip_all, parent = None)]
 async fn spawn(
     key: InstanceKey,
-    init_req_params: lsp::InitializeParams,
+    mut init_req_params: lsp::InitializeParams,
+    options: &InstanceOptions,
     // Caller `get_or_spawn` is holding a lock to the map, we must not try to
     // lock it within this function to not cause deadlock, only spawned tasks
     // are allowed to lock it again.
@@ -762,9 +868,34 @@ async fn spawn(
 
     let workspace_folders = initial_workspace_folders(&init_req_params);
 
-    let mut init_result = initialize_handshake(init_req_params, &mut reader, &mut writer)
-        .await
-        .context("server handshake")?;
+    let settings =
+        options
+            .server_settings
+            .get(&key.server)
+            .and_then(|path| match settings::load(path) {
+                Ok(settings) => {
+                    info!(path, "lspmux owns the server settings");
+                    Some(settings)
+                }
+                Err(err) => {
+                    error!(?err, "loading server settings, leaving them to the clients");
+                    None
+                }
+            });
+
+    capabilities::force_mux_capabilities(&mut init_req_params.capabilities);
+    if let Some(settings) = &settings {
+        init_req_params.initialization_options = Some(lsp::InitializationOptions {
+            lsp_mux: None,
+            other_options: settings.clone(),
+        });
+    }
+    let settings = settings.map(Value::Object);
+
+    let mut init_result =
+        initialize_handshake(init_req_params, settings.as_ref(), &mut reader, &mut writer)
+            .await
+            .context("server handshake")?;
 
     info!("initialized server");
 
@@ -784,6 +915,9 @@ async fn spawn(
         clients: Mutex::default(),
         dynamic_capabilities: Mutex::default(),
         docs: Mutex::new(Docs::new(encoding)),
+        progress: Mutex::new(Progress::new(Instant::now())),
+        settle: options.settle,
+        settings,
         request_snapshots: Mutex::default(),
         execute_commands: Mutex::default(),
         close: Notify::new(),
@@ -792,6 +926,7 @@ async fn spawn(
 
     task::spawn(stdout_task(instance.clone(), reader).in_current_span());
     task::spawn(stdin_task(rx, writer).in_current_span());
+    task::spawn(settle_task(Arc::downgrade(&instance)).in_current_span());
 
     task::spawn(wait_task(instance.clone(), map, child).in_current_span());
 
@@ -801,6 +936,7 @@ async fn spawn(
 #[instrument(skip_all)]
 async fn initialize_handshake(
     init_req_params: lsp::InitializeParams,
+    settings: Option<&Value>,
     reader: &mut LspReader<BufReader<ChildStdout>>,
     writer: &mut LspWriter<ChildStdin>,
 ) -> Result<lsp::InitializeResult> {
@@ -845,7 +981,37 @@ async fn initialize_handshake(
         .await
         .context("send initialized notification")?;
 
+    if let Some(settings) = settings {
+        // Pushed once, some servers don't ask with `workspace/configuration`
+        let notif = Notification {
+            jsonrpc: Version,
+            method: "workspace/didChangeConfiguration".into(),
+            params: json!({ "settings": settings }),
+        };
+        writer
+            .write_message(&notif.into())
+            .await
+            .context("send workspace/didChangeConfiguration notification")?;
+    }
+
     Ok(result)
+}
+
+/// Answer owed diagnostics once the server settled, until the instance is gone
+async fn settle_task(instance: Weak<Instance>) {
+    let Some(settle) = instance.upgrade().map(|instance| instance.settle) else {
+        return;
+    };
+    let mut interval = tokio::time::interval((settle / 4).max(Duration::from_millis(1)));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(instance) = instance.upgrade() else {
+            break;
+        };
+        instance.answer_owed_diagnostics().await;
+    }
+    debug!("settle task stopped");
 }
 
 /// Read errors from language server stderr and log them
@@ -910,7 +1076,7 @@ async fn wait_task(
             }
             exit = child.wait() => {
                 // Remove the closing instance from the map so new clients spawn their own instance
-                instance_map.lock().await.0.remove(&key);
+                instance_map.lock().await.instances.remove(&key);
 
                 // Disconnect all current clients
                 //
@@ -1033,29 +1199,25 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 }
             }
 
-            Message::Request(mut req)
-                if [
-                    "window/workDoneProgress/create",
-                    "workspace/codeLens/refresh",
-                    "workspace/semanticTokens/refresh",
-                    "workspace/inlayHint/refresh",
-                    "workspace/inlineValue/refresh",
-                    "workspace/diagnostic/refresh",
-                ]
-                .contains(&req.method.as_str()) =>
-            {
-                // All these server requests have null responses and we need
-                // to inform all clients. We can forward the request to all
-                // clients, send a fake successful response and ignore the real
-                // client responses.
-                trace!(?req, "server request {}", req.method.as_str());
+            Message::Request(mut req) if req.method == "window/workDoneProgress/create" => {
+                // It has a null response and we need to inform all clients.
+                // We can forward the request to all clients, send a fake
+                // successful response and ignore the real client responses.
+                trace!(?req, "server request window/workDoneProgress/create");
+
+                // Clients attaching later get it replayed
+                instance.progress.lock().await.create(&req.params);
 
                 let id = req.id;
                 req.id = id.tag(Tag::Drop);
 
-                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
+                let deliveries =
+                    translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
                 for (client_id, params) in deliveries {
-                    let req = Request { params, ..req.clone() };
+                    let req = Request {
+                        params,
+                        ..req.clone()
+                    };
                     let _ = clients[&client_id].send_message(req.into()).await;
                 }
 
@@ -1064,12 +1226,42 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     .await;
             }
 
+            Message::Request(mut req) if REFRESH_REQUESTS.contains(&req.method.as_str()) => {
+                // Null response, answered by us. Only clients which declared
+                // support for it get it, their responses are ignored.
+                trace!(?req, "server request {}", req.method.as_str());
+
+                let id = req.id;
+                req.id = id.tag(Tag::Drop);
+
+                let capability = refresh_capability(&req.method).unwrap_or_default();
+                for client in clients.values() {
+                    if client.record().declares(&capability) {
+                        let _ = client.send_message(req.clone().into()).await;
+                    }
+                }
+
+                let _ = instance
+                    .send_message(ResponseSuccess::null(id).into())
+                    .await;
+            }
+
             Message::Request(req) if req.method == "workspace/configuration" => {
-                // Response to `workspace/configuration` should be the same from
-                // any client. So we'll just pick the first and let it answer.
                 debug!(?req, "server request workspace/configuration");
 
-                if let Some(client) = clients.values().next() {
+                if let Some(settings) = &instance.settings {
+                    let res = ResponseSuccess {
+                        jsonrpc: Version,
+                        result: settings::configuration_result(settings, &req.params),
+                        id: req.id,
+                    };
+                    let _ = instance.send_message(res.into()).await;
+                } else if let Some(client) = clients
+                    .values()
+                    .find(|client| client.record().declares("workspace.configuration"))
+                {
+                    // Response to `workspace/configuration` should be the same
+                    // from any client. So we'll just pick one and let it answer.
                     match request_for_client(&*instance.docs.lock().await, client.id(), req) {
                         Ok(mut req) => {
                             req.id = req.id.tag(Tag::Forward);
@@ -1081,62 +1273,86 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                         }
                     }
                 } else {
-                    // If there is no client connected at this moment we'll
-                    // ignore the request.
+                    // Nobody to ask, the server would wait forever
+                    let res = ResponseSuccess {
+                        jsonrpc: Version,
+                        result: settings::null_configuration_result(&req.params),
+                        id: req.id,
+                    };
+                    let _ = instance.send_message(res.into()).await;
                 }
             }
 
-            Message::Request(mut req) if req.method == "client/registerCapability" => {
-                // These need to be forwarded to every client so they're aware
-                // of the capability. The response doesn't contain anything
-                // important so we can safely ignore the real answers and send a
-                // fake one to the server.
+            Message::Request(req) if req.method == "client/registerCapability" => {
+                // Forwarded to every client which supports dynamic
+                // registration of the capability, and cached for clients
+                // coming later. The response doesn't contain anything
+                // important so we can safely ignore the real answers and send
+                // a fake one to the server.
                 debug!(?req, "server request client/registerCapability");
 
-                let id = req.id;
-                req.id = id.tag(Tag::Drop);
-
-                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
-                for (client_id, params) in deliveries {
-                    let req = Request { params, ..req.clone() };
-                    let _ = clients[&client_id].send_message(req.into()).await;
-                }
-
-                // We need to cache the dynamic capabilities registrations for
-                // any client that might come later.
-                if let Err(err) = instance.register_capabilities(req.params).await {
-                    warn!(?err, "error registering capabilities");
+                match serde_json::from_value::<lsp::RegistrationParams>(req.params.clone()) {
+                    Ok(params) => {
+                        let deliveries = instance
+                            .dynamic_capabilities
+                            .lock()
+                            .await
+                            .register(params.registrations);
+                        for (client_id, registrations) in deliveries {
+                            let req = Request {
+                                jsonrpc: Version,
+                                method: req.method.clone(),
+                                params: serde_json::to_value(lsp::RegistrationParams {
+                                    registrations,
+                                })
+                                .unwrap(),
+                                id: req.id.tag(Tag::Drop),
+                            };
+                            if let Some(client) = clients.get(&client_id) {
+                                let _ = client.send_message(req.into()).await;
+                            }
+                        }
+                    }
+                    Err(err) => warn!(?err, "error parsing client/registerCapability params"),
                 }
 
                 let _ = instance
-                    .send_message(ResponseSuccess::null(id).into())
+                    .send_message(ResponseSuccess::null(req.id).into())
                     .await;
             }
 
-            Message::Request(mut req) if req.method == "client/unregisterCapability" => {
-                // These need to be forwarded to every client so they're aware
-                // of the capability not being available anymore. The response
-                // doesn't contain anything important so we can safely ignore
-                // the real answers and send a fake one to the server.
+            Message::Request(req) if req.method == "client/unregisterCapability" => {
+                // Forwarded to the clients which received the registrations,
+                // the cache stops announcing them to new clients.
                 debug!(?req, "server request client/unregisterCapability");
 
-                let id = req.id;
-                req.id = id.tag(Tag::Drop);
-
-                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &req.params);
-                for (client_id, params) in deliveries {
-                    let req = Request { params, ..req.clone() };
-                    let _ = clients[&client_id].send_message(req.into()).await;
-                }
-
-                // We need to remove this registration from the cache so we
-                // don't announce it to new clients anymore.
-                if let Err(err) = instance.unregister_capabilities(req.params).await {
-                    warn!(?err, "error unregistering capabilities");
+                match serde_json::from_value::<lsp::UnregistrationParams>(req.params.clone()) {
+                    Ok(params) => {
+                        let deliveries = instance
+                            .dynamic_capabilities
+                            .lock()
+                            .await
+                            .unregister(params.unregistrations);
+                        for (client_id, unregistrations) in deliveries {
+                            let req = Request {
+                                jsonrpc: Version,
+                                method: req.method.clone(),
+                                params: serde_json::to_value(lsp::UnregistrationParams {
+                                    unregistrations,
+                                })
+                                .unwrap(),
+                                id: req.id.tag(Tag::Drop),
+                            };
+                            if let Some(client) = clients.get(&client_id) {
+                                let _ = client.send_message(req.into()).await;
+                            }
+                        }
+                    }
+                    Err(err) => warn!(?err, "error parsing client/unregisterCapability params"),
                 }
 
                 let _ = instance
-                    .send_message(ResponseSuccess::null(id).into())
+                    .send_message(ResponseSuccess::null(req.id).into())
                     .await;
             }
 
@@ -1153,13 +1369,12 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     let execute_commands = instance.execute_commands.lock().await;
                     let owners = execute_commands.owners();
                     let uris = workspace_edit_uris(&req.params["edit"]);
-                    let selected = select_request_owner(&owners)
-                        .and_then(|client_id| {
-                            clients
-                                .get(&client_id)
-                                .map(|client| (client_id, client))
-                                .ok_or("the client which triggered the request disconnected")
-                        });
+                    let selected = select_request_owner(&owners).and_then(|client_id| {
+                        clients
+                            .get(&client_id)
+                            .map(|client| (client_id, client))
+                            .ok_or("the client which triggered the request disconnected")
+                    });
                     match selected {
                         Ok((client_id, client)) => check_apply_edit(
                             &docs,
@@ -1168,7 +1383,9 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                             &uris,
                             &read_file_uri,
                         )
-                        .map_err(|reason| Message::from(apply_edit_failure(req.id.clone(), &reason)))
+                        .map_err(|reason| {
+                            Message::from(apply_edit_failure(req.id.clone(), &reason))
+                        })
                         .and_then(|()| request_for_client(&docs, client_id, req))
                         .map(|req| (client_id, client, req)),
                         Err(reason) => Err(apply_edit_failure(req.id, reason).into()),
@@ -1177,7 +1394,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
 
                 match routed {
                     Ok((client_id, client, mut req)) => {
-                        debug!(?client_id, "forwarding workspace/applyEdit to the client which triggered it");
+                        debug!(
+                            ?client_id,
+                            "forwarding workspace/applyEdit to the client which triggered it"
+                        );
                         req.id = req.id.tag(Tag::Forward);
                         let _ = client.send_message(req.into()).await;
                     }
@@ -1221,7 +1441,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     Ok((client_id, client)) => {
                         match request_for_client(&*instance.docs.lock().await, client_id, req) {
                             Ok(mut req) => {
-                                debug!(?client_id, "forwarding {} to the client which triggered it", req.method);
+                                debug!(
+                                    ?client_id,
+                                    "forwarding {} to the client which triggered it", req.method
+                                );
                                 req.id = req.id.tag(Tag::Forward);
                                 let _ = client.send_message(req.into()).await;
                             }
@@ -1243,7 +1466,10 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     Err(reason) => {
                         // Show the message to everyone, nobody gets to pick
                         // an action.
-                        debug!(reason, "broadcasting window/showMessageRequest as window/showMessage");
+                        debug!(
+                            reason,
+                            "broadcasting window/showMessageRequest as window/showMessage"
+                        );
                         let notif = Notification {
                             jsonrpc: Version,
                             method: "window/showMessage".into(),
@@ -1283,6 +1509,7 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 let deliveries = {
                     let connected = clients.keys().copied().collect::<Vec<_>>();
                     let mut docs = instance.docs.lock().await;
+                    instance.progress.lock().await.touch(Instant::now());
                     docs.publish_diagnostics(notif.params, &connected)
                 };
                 for (client_id, notif) in deliveries {
@@ -1291,11 +1518,23 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
             }
 
             Message::Notification(notif) => {
+                if notif.method == "$/progress" {
+                    // Tracked for clients attaching later and settling
+                    instance
+                        .progress
+                        .lock()
+                        .await
+                        .progress(&notif.params, Instant::now());
+                }
                 // Server notifications don't expect a response. We can forward
                 // them to all clients, except those they're unsafe for.
-                let deliveries = translated_for_each(&*instance.docs.lock().await, &clients, &notif.params);
+                let deliveries =
+                    translated_for_each(&*instance.docs.lock().await, &clients, &notif.params);
                 for (client_id, params) in deliveries {
-                    let notif = Notification { params, ..notif.clone() };
+                    let notif = Notification {
+                        params,
+                        ..notif.clone()
+                    };
                     let _ = clients[&client_id].send_message(notif.into()).await;
                 }
             }
@@ -1375,7 +1614,11 @@ mod tests {
             snapshot: Snapshot::default(),
         };
         let tracker = ExecuteCommandTracker {
-            in_flight: vec![command("1", A, false), command("2", B, true), command("3", A, false)],
+            in_flight: vec![
+                command("1", A, false),
+                command("2", B, true),
+                command("3", A, false),
+            ],
         };
         assert_eq!(tracker.owners(), [owner(A), orphan(B)]);
     }
@@ -1393,7 +1636,14 @@ mod tests {
         });
         assert_eq!(
             workspace_edit_uris(&edit),
-            ["file:///a", "file:///b", "file:///c", "file:///d", "file:///e", "file:///f"]
+            [
+                "file:///a",
+                "file:///b",
+                "file:///c",
+                "file:///d",
+                "file:///e",
+                "file:///f"
+            ]
         );
 
         // WorkspaceEdits nested in results, e.g. code actions
@@ -1405,7 +1655,9 @@ mod tests {
         assert_eq!(workspace_edit_uris(&actions), ["file:///g", "file:///h"]);
         // applyEdit params
         assert_eq!(
-            workspace_edit_uris(&json!({ "label": "l", "edit": { "changes": { "file:///i": [] } } })),
+            workspace_edit_uris(
+                &json!({ "label": "l", "edit": { "changes": { "file:///i": [] } } })
+            ),
             ["file:///i"]
         );
     }
@@ -1416,9 +1668,7 @@ mod tests {
     /// with B's text, A matched server version 1
     fn diverged_docs() -> Docs {
         let mut docs = Docs::new(PositionEncoding::Utf16);
-        let open = |version: i64, text: &str| {
-            json!({ "textDocument": { "uri": U, "languageId": "haskell", "version": version, "text": text } })
-        };
+        let open = |version: i64, text: &str| json!({ "textDocument": { "uri": U, "languageId": "haskell", "version": version, "text": text } });
         docs.did_open(A, &open(10, "a")).unwrap();
         docs.did_open(B, &open(20, "b")).unwrap();
         docs
@@ -1485,9 +1735,14 @@ mod tests {
             id: RequestId::Number(3),
         };
 
-        let unsafe_res =
-            serde_json::to_value(response_for_client(&docs, A, &Snapshot::default(), res(2), &no_disk))
-                .unwrap();
+        let unsafe_res = serde_json::to_value(response_for_client(
+            &docs,
+            A,
+            &Snapshot::default(),
+            res(2),
+            &no_disk,
+        ))
+        .unwrap();
         assert_eq!(
             unsafe_res,
             json!({ "jsonrpc": "2.0", "id": 3, "error": {
@@ -1496,9 +1751,14 @@ mod tests {
             } })
         );
 
-        let safe_res =
-            serde_json::to_value(response_for_client(&docs, B, &Snapshot::default(), res(2), &no_disk))
-                .unwrap();
+        let safe_res = serde_json::to_value(response_for_client(
+            &docs,
+            B,
+            &Snapshot::default(),
+            res(2),
+            &no_disk,
+        ))
+        .unwrap();
         assert_eq!(safe_res["result"][0]["textDocument"]["version"], 20);
     }
 
@@ -1523,7 +1783,10 @@ mod tests {
         let snapshot = docs.snapshot(A);
 
         // unchanged
-        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        assert_eq!(
+            check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk),
+            Ok(())
+        );
         // no command in flight
         assert!(check_apply_edit(&docs, A, [], &uris, &no_disk).is_err());
 
@@ -1534,17 +1797,26 @@ mod tests {
 
         // B switches the server to its text during the command
         let snapshot = docs.snapshot(A);
-        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        assert_eq!(
+            check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk),
+            Ok(())
+        );
         docs.did_change(B, &change(U, 2, "b")).unwrap();
         let err = check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk).unwrap_err();
         assert!(err.contains("another client's text"), "{err}");
         let reply = serde_json::to_value(apply_edit_failure(RequestId::Number(7), &err)).unwrap();
         assert_eq!(reply["result"]["applied"], false);
-        assert!(reply["result"]["failureReason"].as_str().unwrap().starts_with("lspmux: "));
+        assert!(reply["result"]["failureReason"]
+            .as_str()
+            .unwrap()
+            .starts_with("lspmux: "));
 
         // with several commands in flight every snapshot must be safe
         let newer = docs.snapshot(A);
-        assert_eq!(check_apply_edit(&docs, A, [&newer], &uris, &no_disk), Ok(()));
+        assert_eq!(
+            check_apply_edit(&docs, A, [&newer], &uris, &no_disk),
+            Ok(())
+        );
         assert!(check_apply_edit(&docs, A, [&snapshot, &newer], &uris, &no_disk).is_err());
     }
 
@@ -1558,10 +1830,16 @@ mod tests {
         let snapshot = docs.snapshot(A);
 
         // nobody has it open
-        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk), Ok(()));
+        assert_eq!(
+            check_apply_edit(&docs, A, [&snapshot], &uris, &no_disk),
+            Ok(())
+        );
         // B has it open with the disk text
         docs.did_open(B, &open(O, 1, "on disk")).unwrap();
-        assert_eq!(check_apply_edit(&docs, A, [&snapshot], &uris, &disk), Ok(()));
+        assert_eq!(
+            check_apply_edit(&docs, A, [&snapshot], &uris, &disk),
+            Ok(())
+        );
         // B's text differs from disk
         docs.did_change(B, &change(O, 2, "unsaved")).unwrap();
         let err = check_apply_edit(&docs, A, [&snapshot], &uris, &disk).unwrap_err();
@@ -1603,7 +1881,9 @@ mod tests {
         let res = response_for_client(&docs, A, &snapshot, code_action(U), &no_disk);
         assert!(is_foreign_text_error(&res));
         let plain = ResponseSuccess::null(RequestId::Number(3));
-        assert!(is_foreign_text_error(&response_for_client(&docs, A, &snapshot, plain, &no_disk)));
+        assert!(is_foreign_text_error(&response_for_client(
+            &docs, A, &snapshot, plain, &no_disk
+        )));
     }
 
     #[test]
@@ -1625,5 +1905,48 @@ mod tests {
         docs.did_change(B, &change(O, 2, "unsaved")).unwrap();
         let res = response_for_client(&docs, A, &snapshot, code_action(O), &disk);
         assert!(is_foreign_text_error(&res));
+    }
+
+    #[test]
+    fn owed_diagnostics_wait_for_the_server_to_settle() {
+        let settle = Duration::from_millis(1500);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut progress = Progress::new(start);
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(A, &open(U, 1, "broken")).unwrap();
+        let cached = json!({ "uri": U, "version": 1, "diagnostics": [{ "message": "err" }] });
+        docs.publish_diagnostics(cached, &[A]);
+
+        // re-sending the same text reaches neither the server nor a publish
+        let effects = docs.did_change(A, &change(U, 2, "broken")).unwrap();
+        assert!(effects.to_server.is_empty());
+        assert!(owed_when_settled(&mut docs, &progress, at(1000), settle).is_empty());
+
+        // activity before settling, e.g. another document's change, delays it
+        progress.touch(at(1000));
+        assert!(owed_when_settled(&mut docs, &progress, at(2000), settle).is_empty());
+
+        // so does server progress for as long as it's active
+        progress.progress(
+            &json!({ "token": 1, "value": { "kind": "begin", "title": "Processing" } }),
+            at(2000),
+        );
+        assert!(owed_when_settled(&mut docs, &progress, at(10_000), settle).is_empty());
+        progress.progress(
+            &json!({ "token": 1, "value": { "kind": "end" } }),
+            at(10_000),
+        );
+        assert!(owed_when_settled(&mut docs, &progress, at(11_000), settle).is_empty());
+
+        let answers = owed_when_settled(&mut docs, &progress, at(11_500), settle);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].0, A);
+        assert_eq!(
+            answers[0].1.params,
+            json!({ "uri": U, "version": 2, "diagnostics": [{ "message": "err" }] })
+        );
+        // answered once
+        assert!(owed_when_settled(&mut docs, &progress, at(20_000), settle).is_empty());
     }
 }

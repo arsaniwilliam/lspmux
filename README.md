@@ -164,7 +164,63 @@ log_filters = "info"
 # going to be used for looking up a relative `--server-path`.
 # Example: pass_environment = ["PATH", "LD_LIBRARY_PATH"]
 pass_environment = []
+
+# milliseconds the language server must be quiet before lspmux answers owed
+# diagnostics itself
+#
+# a client is owed diagnostics for a document after it opens, changes or saves
+# it. servers like haskell-language-server only publish diagnostics when they
+# change, so a client re-sending unchanged text, or a clean file, would wait
+# forever. once the server has no work done progress active and sent nothing
+# (and was sent no document changes) for this long, lspmux sends each owed
+# client the diagnostics the server last published for its text, or an empty
+# list, at the client's document version.
+settle_ms = 1500
+
+# settings lspmux owns for a server, keyed by the `--server-path` value
+#
+# the value is a JSON file with the settings object, its top-level keys are
+# sections, e.g. `{"haskell": {...}}`. a leading "~/" expands to $HOME. with an
+# entry for a server lspmux sends the object as the server's
+# `initializationOptions` and in one `workspace/didChangeConfiguration` after
+# initialization, answers `workspace/configuration` from it (a `section` is a
+# dotted path, missing ones are `null`) and drops the clients'
+# `workspace/didChangeConfiguration`. a file which can't be loaded is logged
+# and the server is treated as unconfigured: clients answer as usual.
+#
+# there are no entries by default.
+[server_settings]
+# "haskell-language-server-wrapper" = "~/.config/lspmux/settings/hls.json"
 ```
+
+
+## Sharing a server between different clients
+
+Clients sharing a server instance (say an editor and a headless agent) may
+support different parts of the protocol. lspmux keeps every client's
+`initialize` capabilities and `clientInfo` (shown by `lspmux status`) and:
+
+- initializes the server with the first client's parameters, but always
+  declares `workspace.configuration`,
+  `workspace.didChangeWatchedFiles.dynamicRegistration`,
+  `window.workDoneProgress` and
+  `textDocument.publishDiagnostics.versionSupport`, lspmux handles these
+  itself
+- forwards `client/registerCapability` only to clients declaring
+  `dynamicRegistration` for the method (unknown methods go to everyone),
+  including registrations replayed to clients connecting later, and
+  unregistrations only to clients which got the registration
+- forwards `workspace/didChangeWatchedFiles` only from one watcher, the
+  earliest connected client which got the watched files registration, the
+  next one takes over when it disconnects; without a watcher every client's
+  notifications are forwarded
+- answers `workspace/*/refresh` server requests itself and forwards them only
+  to clients declaring `refreshSupport`
+- replays active work done progress to clients connecting to a running server;
+  when nothing is in progress they get a progress on the `lspmux/attach` token
+  which ends right away, so clients waiting for the server to finish loading
+  don't have to time out
+- answers owed diagnostics once the server settled, see `settle_ms`
 
 
 ## Other LSP servers

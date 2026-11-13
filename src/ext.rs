@@ -103,6 +103,9 @@ pub async fn status(config: &Config, json: bool) -> Result<()> {
         for client in instance.clients {
             println!("    - Client");
             println!("      id: {}", client.id);
+            if let Some(name) = client.name {
+                println!("      name: {}", name);
+            }
             println!("      files:");
             for file in client.files {
                 println!("        - {}", file);

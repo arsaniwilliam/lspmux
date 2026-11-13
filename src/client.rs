@@ -12,6 +12,7 @@ use tokio::task;
 use tracing::{debug, error, info, warn, Instrument};
 use uriparse::URI;
 
+use crate::capabilities::ClientRecord;
 use crate::instance::{self, Instance, InstanceKey, InstanceMap};
 use crate::lsp::ext::{self, LspMuxOptions, Tag};
 use crate::lsp::jsonrpc::{
@@ -87,17 +88,24 @@ pub async fn process(
 #[derive(Clone)]
 pub struct Client {
     id: usize,
+    record: Arc<ClientRecord>,
     sender: mpsc::Sender<Message>,
 }
 
 impl Client {
-    fn new(id: usize) -> (Client, mpsc::Receiver<Message>) {
+    fn new(id: usize, record: ClientRecord) -> (Client, mpsc::Receiver<Message>) {
         let (sender, receiver) = mpsc::channel(16);
-        (Client { id, sender }, receiver)
+        let record = Arc::new(record);
+        (Client { id, record, sender }, receiver)
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    /// What the client declared in its `initialize` request
+    pub fn record(&self) -> &Arc<ClientRecord> {
+        &self.record
     }
 
     /// Send a message to the client channel
@@ -189,6 +197,7 @@ async fn connect(
         env,
         workspace_root,
     };
+    let record = ClientRecord::new(&init_params);
     let instance = instance::get_or_spawn(instance_map, key, init_params).await?;
 
     // Respond to client's `initialize` request using a response result from
@@ -221,7 +230,7 @@ async fn connect(
     }
     info!("initialized client");
 
-    let (client, client_rx) = Client::new(client_id);
+    let (client, client_rx) = Client::new(client_id, record);
     task::spawn(input_task(client_rx, writer).in_current_span());
     instance.add_client(client.clone()).await;
 
@@ -422,11 +431,37 @@ async fn output_task(
                 }
             }
 
+            Message::Notification(notif) if notif.method == "textDocument/didSave" => {
+                if instance.save_file(client.id, notif).await.is_err() {
+                    break;
+                }
+            }
+
+            Message::Notification(notif) if notif.method == "workspace/didChangeWatchedFiles" => {
+                // Clients watching the same files report the same changes,
+                // the server gets them once.
+                if !instance.forwards_watched_files_from(client.id).await {
+                    debug!("dropping workspace/didChangeWatchedFiles of a client which isn't the watcher");
+                } else if instance.forward_notification(notif).await.is_err() {
+                    break;
+                }
+            }
+
+            Message::Notification(notif)
+                if notif.method == "workspace/didChangeConfiguration"
+                    && instance.owns_settings() =>
+            {
+                debug!(
+                    "dropping workspace/didChangeConfiguration, lspmux owns the server settings"
+                );
+            }
+
             Message::Notification(mut notif) if notif.method == "$/cancelRequest" => {
                 // The server knows the request under its tagged ID
                 match serde_json::from_value::<RequestId>(notif.params["id"].take()) {
                     Ok(id) => {
-                        notif.params["id"] = serde_json::to_value(id.tag(Tag::ClientId(client.id))).unwrap();
+                        notif.params["id"] =
+                            serde_json::to_value(id.tag(Tag::ClientId(client.id))).unwrap();
                         if instance.forward_notification(notif).await.is_err() {
                             break;
                         }

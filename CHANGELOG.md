@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Added
+
+- configuration option `settle_ms`: clients which opened, changed or saved a document are owed diagnostics for it, once the server has no progress active and was quiet for `settle_ms` lspmux answers them itself with the server's latest diagnostics for their text or an empty list, at their document version. Servers publishing only on change (haskell-language-server) no longer leave clients waiting
+- configuration option `server_settings`: maps a `--server-path` to a JSON settings file lspmux sends as `initializationOptions` and in `workspace/didChangeConfiguration`, and answers `workspace/configuration` from; client `workspace/didChangeConfiguration` is dropped for such servers
+- clients connecting to a running server get the active work done progress replayed, or a progress on the `lspmux/attach` token which ends right away when nothing is in progress
+- `lspmux status` shows each client's `clientInfo.name`
+
+### Changed
+
+- the server is initialized declaring `workspace.configuration`, `workspace.didChangeWatchedFiles.dynamicRegistration`, `window.workDoneProgress` and `textDocument.publishDiagnostics.versionSupport` regardless of the first client
+- dynamic registrations (live and replayed) only reach clients declaring dynamic registration support for the method, unregistrations only the clients which got the registration
+- `workspace/didChangeWatchedFiles` is forwarded only from one watcher client, the earliest connected one which got the watched files registration
+- `workspace/*/refresh` server requests (now including `workspace/foldingRange/refresh`) only reach clients declaring `refreshSupport`
+- `workspace/configuration` is forwarded only to a client declaring `workspace.configuration`; without one it's answered with `null` for every item instead of never
+
+
 ## [v0.3.0] - 2025-10-12
 
 ### Changed

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(target_family = "unix")]
@@ -37,6 +37,10 @@ mod default {
 
     pub fn pass_environment() -> BTreeSet<String> {
         BTreeSet::new()
+    }
+
+    pub fn settle_ms() -> u64 {
+        1500
     }
 }
 
@@ -113,6 +117,16 @@ pub struct Config {
 
     #[serde(default = "default::pass_environment")]
     pub pass_environment: BTreeSet<String>,
+
+    /// Milliseconds the server must be quiet before lspmux answers owed
+    /// diagnostics itself
+    #[serde(default = "default::settle_ms")]
+    pub settle_ms: u64,
+
+    /// `--server-path` value to the JSON file with the settings lspmux
+    /// answers `workspace/configuration` with
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_settings: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -139,6 +153,8 @@ impl Default for Config {
             connect: default::connect(),
             log_filters: default::log_filters(),
             pass_environment: default::pass_environment(),
+            settle_ms: default::settle_ms(),
+            server_settings: BTreeMap::new(),
         }
     }
 }
