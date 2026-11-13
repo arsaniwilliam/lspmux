@@ -604,48 +604,62 @@ impl Docs {
             .any(|doc| doc.clients.values().any(|client| client.owed))
     }
 
-    /// Diagnostics for every client owed them, to be sent once the server
-    /// settled, in the client's current version numbering
+    /// Diagnostics for every owed client whose text the server checked, to
+    /// be sent once the server settled, in the client's current version
+    /// numbering
     ///
     /// The server publishes only when a document's diagnostics change, so
     /// once it's settled its latest publish (the cache, or none for an empty
     /// one) describes its current text even when versioned for older text.
-    /// They go to clients whose text is the server's current text or the
-    /// text they're versioned for, other clients get an empty list.
+    /// Clients with the server's current text get that, clients whose text
+    /// the cached publish is versioned for get the cache. Any other client's
+    /// text the server never checked, it stays owed until its text reaches
+    /// the server (resync on its next change or request).
     pub fn take_owed_diagnostics(&mut self) -> Vec<(usize, Notification)> {
         let mut deliveries = Vec::new();
-        for (uri, doc) in &self.docs {
-            for (&client_id, client) in &doc.clients {
+        for (uri, doc) in &mut self.docs {
+            let cached = self.diagnostics.get(uri);
+            for (&client_id, client) in &mut doc.clients {
                 if !client.owed {
                     continue;
                 }
-                let diagnostics = self
-                    .diagnostics
-                    .get(uri)
-                    .filter(|cached| {
-                        client.text == doc.server.text
-                            || self.diagnostics_for(client_id, cached).is_some()
-                    })
-                    .map_or_else(|| json!([]), |cached| cached["diagnostics"].clone());
+                let diagnostics = if client.text == doc.server.text {
+                    cached.map_or_else(|| json!([]), |cached| cached["diagnostics"].clone())
+                } else {
+                    let checked = cached.filter(|cached| {
+                        cached["version"]
+                            .as_i64()
+                            .is_some_and(|version| client.matched_server_version == Some(version))
+                    });
+                    match checked {
+                        Some(cached) => cached["diagnostics"].clone(),
+                        None => continue,
+                    }
+                };
+                client.owed = false;
                 let params =
                     json!({ "uri": uri, "version": client.version, "diagnostics": diagnostics });
                 deliveries.push((client_id, publish_diagnostics(params)));
-            }
-        }
-        for doc in self.docs.values_mut() {
-            for client in doc.clients.values_mut() {
-                client.owed = false;
             }
         }
         deliveries
     }
 
     /// All cached diagnostics, for a newly connected client
+    ///
+    /// Unversioned: the client has no document open yet, and the cached
+    /// versions are the server's numbering, which a client could mistake for
+    /// its own once it opens the document.
     pub fn replay_diagnostics(&self) -> Vec<Notification> {
         self.diagnostics
             .values()
             .cloned()
-            .map(publish_diagnostics)
+            .map(|mut params| {
+                if let Some(params) = params.as_object_mut() {
+                    params.remove("version");
+                }
+                publish_diagnostics(params)
+            })
             .collect()
     }
 
@@ -1037,6 +1051,10 @@ mod tests {
             .collect::<Vec<_>>();
         uris.sort();
         assert_eq!(uris, [U, V]);
+        assert!(docs
+            .replay_diagnostics()
+            .iter()
+            .all(|n| n.params.get("version").is_none()));
 
         // an empty publish prunes the entry
         docs.publish_diagnostics(diags(V, None, 0), &[1]);
@@ -1267,25 +1285,85 @@ mod tests {
         let mut docs = Docs::new(PositionEncoding::Utf16);
         docs.did_open(1, &open(U, 10, "a")).unwrap();
         docs.did_open(2, &open(U, 20, "b")).unwrap();
-        // server at version 2 with client 2's text, client 1's is older
+        // server at version 2 with client 2's text, an empty publish
+        // satisfies client 2, client 1's text is older
+        let delivered = docs.publish_diagnostics(diags(U, Some(2), 0), &[1, 2]);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, 2);
+
+        // the server never checked client 1's text, it stays owed however
+        // often the server settles
+        assert!(take_owed(&mut docs).is_empty());
+        assert!(take_owed(&mut docs).is_empty());
+        assert!(docs.any_owed());
+
+        // its next change brings its text to the server, answered once settled
+        let e = docs.did_change(1, &change(U, 11, full("a"))).unwrap();
+        assert_eq!(e.to_server[0].params["textDocument"]["version"], 3);
+        assert_eq!(
+            take_owed(&mut docs),
+            [(1, json!({ "uri": U, "version": 11, "diagnostics": [] }))]
+        );
+        assert!(!docs.any_owed());
+
+        // a real publish for its text satisfies it before settling
+        docs.did_change(1, &change(U, 12, full("a"))).unwrap();
+        let delivered = docs.publish_diagnostics(diags(U, Some(3), 1), &[1, 2]);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, 1);
+        assert_eq!(delivered[0].1.params["version"], 12);
+        assert!(!docs.any_owed());
+        assert!(take_owed(&mut docs).is_empty());
+    }
+
+    #[test]
+    fn owed_not_answered_for_unchecked_text() {
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        // an editor with an unsaved broken buffer, an agent with the disk text
+        docs.did_open(1, &open(U, 1, "broken")).unwrap();
+        docs.did_open(2, &open(U, 5, "disk")).unwrap();
+        // the server checked the agent's text (server version 2)
         let delivered = docs.publish_diagnostics(diags(U, Some(2), 1), &[1, 2]);
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, 2);
-        // client 1 didn't get them, it's still owed and gets an empty list:
-        // the server has client 2's text and never published for client 1's
-        assert_eq!(
-            take_owed(&mut docs),
-            [(1, json!({ "uri": U, "version": 10, "diagnostics": [] }))]
-        );
 
-        // an empty publish satisfies too
-        docs.did_change(2, &change(U, 21, full("b"))).unwrap();
-        docs.publish_diagnostics(diags(U, Some(2), 0), &[1, 2]);
+        // the agent re-sends identical text, nothing reaches the server
+        let e = docs.did_change(2, &change(U, 6, full("disk"))).unwrap();
+        assert!(e.to_server.is_empty());
+        // settled: the agent gets the diagnostics of its text, the editor's
+        // text was never checked, it gets neither them nor a clean list
+        let owed = take_owed(&mut docs);
+        assert_eq!(
+            owed,
+            [(
+                2,
+                json!({ "uri": U, "version": 6, "diagnostics": diags(U, None, 1)["diagnostics"] })
+            )]
+        );
+        assert!(docs.any_owed());
+        assert!(take_owed(&mut docs).is_empty());
+
+        // the editor's change resyncs the server to its text (version 3)
+        let e = docs.did_change(1, &change(U, 2, full("broken"))).unwrap();
+        assert_eq!(methods(&e.to_server), ["textDocument/didChange"]);
+        assert_eq!(e.to_server[0].params["textDocument"]["version"], 3);
+        // the server's publish for it reaches only the editor, at its version
+        let delivered = docs.publish_diagnostics(diags(U, Some(3), 2), &[1, 2]);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, 1);
+        assert_eq!(delivered[0].1.params["version"], 2);
+        assert_eq!(
+            delivered[0].1.params["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(!docs.any_owed());
     }
 
     #[test]
-    fn owed_older_matched_text_keeps_its_diagnostics() {
+    fn owed_answered_when_cached_matches_client_text() {
         let mut docs = Docs::new(PositionEncoding::Utf16);
         docs.did_open(1, &open(U, 10, "a")).unwrap();
         docs.publish_diagnostics(diags(U, Some(1), 1), &[1]);
