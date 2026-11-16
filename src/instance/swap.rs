@@ -5,7 +5,7 @@
 //! for writing: client messages arriving meanwhile wait for it, and reach
 //! the new server after its documents were reopened.
 
-use anyhow::ensure;
+use anyhow::{anyhow, ensure};
 use tokio::time::{interval_at, timeout, timeout_at};
 use tracing::{info_span, Span};
 
@@ -348,7 +348,24 @@ impl Instance {
             );
         }
 
-        let (sender, rx) = mpsc::channel(64);
+        // Invariant: nothing below awaits something which depends on the new
+        // server reading its stdin or writing its stdout while the gate is
+        // held. Its `stdout_task` waits for the gate, so a server blocked on
+        // a full stdout pipe stops reading stdin, and a full channel to
+        // `stdin_task` would then hold the gate forever. The reopen batch is
+        // therefore queued without waiting, in a channel with room for all of
+        // it: the documents are the first thing the server sees, before any
+        // client message which was held at the gate.
+        let reopened = self.docs.lock().await.reopen_all();
+        info!(count = reopened.len(), "reopening documents in the new server process");
+        let (sender, rx) = mpsc::channel(reopened.len() + SERVER_CHANNEL_CAPACITY);
+        for notif in reopened {
+            debug!(?notif, "reopening server document");
+            sender
+                .try_send(notif.into())
+                .map_err(|err| anyhow!("reopening documents in the new server process: {err}"))?;
+        }
+
         let ctl = Arc::new(ProcessCtl::default());
         task::spawn(stdout_task(self.clone(), generation, pid, reader).instrument(span.clone()));
         task::spawn(stdin_task(rx, writer).instrument(span.clone()));
@@ -356,22 +373,9 @@ impl Instance {
         *self.link() = Link {
             generation,
             pid,
-            sender: sender.clone(),
+            sender,
             ctl,
         };
-
-        {
-            let mut docs = self.docs.lock().await;
-            let reopened = docs.reopen_all();
-            info!(count = reopened.len(), "reopening documents in the new server process");
-            for notif in reopened {
-                debug!(?notif, "reopening server document");
-                sender
-                    .send(notif.into())
-                    .await
-                    .context("reopening documents in the new server process")?;
-            }
-        }
         self.progress.lock().await.restarted(Instant::now());
 
         {

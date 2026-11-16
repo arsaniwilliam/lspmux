@@ -36,6 +36,9 @@ use crate::settings;
 
 mod swap;
 
+/// Messages queued for a server process' stdin before senders wait
+const SERVER_CHANNEL_CAPACITY: usize = 64;
+
 /// Specifies server configuration
 ///
 /// If another server with the same configuration is requested we can reuse it.
@@ -1028,7 +1031,7 @@ async fn spawn(
         commands::capabilities_for_clients(&mut init_result.capabilities, pid);
     }
 
-    let (message_writer, rx) = mpsc::channel(64);
+    let (message_writer, rx) = mpsc::channel(SERVER_CHANNEL_CAPACITY);
     let ctl = Arc::new(ProcessCtl::default());
 
     let instance = Arc::new(Instance {
