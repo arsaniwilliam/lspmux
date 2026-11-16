@@ -161,6 +161,10 @@ struct ServerDoc {
     /// Changes whenever the server text switches to text which came from
     /// another client than `synced_from`, values are unique per [`Docs`]
     foreign_epoch: u64,
+    /// The server published diagnostics for the document, or settled
+    /// without, since it has it open. `false` only after
+    /// [`Docs::reopen_all`] until then.
+    checked: bool,
 }
 
 struct Doc {
@@ -362,6 +366,7 @@ impl Docs {
                     version: server_version,
                     synced_from: client_id,
                     foreign_epoch,
+                    checked: true,
                 },
             };
             effects.to_server.push(notification(
@@ -567,6 +572,7 @@ impl Docs {
 
         if let Some(uri) = params["uri"].as_str() {
             if let Some(doc) = self.docs.get_mut(uri) {
+                doc.server.checked = true;
                 for (client_id, _) in &deliveries {
                     if let Some(client) = doc.clients.get_mut(client_id) {
                         client.owed = false;
@@ -584,6 +590,42 @@ impl Docs {
         }
 
         deliveries
+    }
+
+    /// The language server process was replaced: `didOpen` notifications
+    /// for every document, in URI order, to be sent to the new server
+    ///
+    /// They carry the server's current text and the next server version, the
+    /// numbering never restarts. Nothing the new server has to say about a
+    /// document counts as checked until it publishes for it or settles
+    /// without; every client is owed diagnostics again, the cache stays so
+    /// clients keep what they show until then.
+    pub fn reopen_all(&mut self) -> Vec<Notification> {
+        let mut uris = self.docs.keys().cloned().collect::<Vec<_>>();
+        uris.sort();
+        let mut notifications = Vec::new();
+        for uri in uris {
+            let doc = self.docs.get_mut(&uri).unwrap();
+            doc.server.version += 1;
+            doc.server.checked = false;
+            for client in doc.clients.values_mut() {
+                client.matched_server_version =
+                    (client.text == doc.server.text).then_some(doc.server.version);
+                client.owed = true;
+            }
+            notifications.push(notification(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": doc.language_id,
+                        "version": doc.server.version,
+                        "text": doc.server.text,
+                    },
+                }),
+            ));
+        }
+        notifications
     }
 
     /// Handle `textDocument/didSave` from `client_id`
@@ -617,6 +659,7 @@ impl Docs {
     /// the server (resync on its next change or request).
     pub fn take_owed_diagnostics(&mut self) -> Vec<(usize, Notification)> {
         let mut deliveries = Vec::new();
+        let mut unchecked = Vec::new();
         for (uri, doc) in &mut self.docs {
             let cached = self.diagnostics.get(uri);
             for (&client_id, client) in &mut doc.clients {
@@ -624,7 +667,15 @@ impl Docs {
                     continue;
                 }
                 let diagnostics = if client.text == doc.server.text {
-                    cached.map_or_else(|| json!([]), |cached| cached["diagnostics"].clone())
+                    if doc.server.checked {
+                        cached.map_or_else(|| json!([]), |cached| cached["diagnostics"].clone())
+                    } else {
+                        // Only the replaced server ever published for it.
+                        // The new one settled without publishing, so it
+                        // found nothing.
+                        unchecked.push(uri.clone());
+                        json!([])
+                    }
                 } else {
                     let checked = cached.filter(|cached| {
                         cached["version"]
@@ -640,6 +691,12 @@ impl Docs {
                 let params =
                     json!({ "uri": uri, "version": client.version, "diagnostics": diagnostics });
                 deliveries.push((client_id, publish_diagnostics(params)));
+            }
+        }
+        for uri in unchecked {
+            self.diagnostics.remove(&uri);
+            if let Some(doc) = self.docs.get_mut(&uri) {
+                doc.server.checked = true;
             }
         }
         deliveries
@@ -1405,5 +1462,74 @@ mod tests {
         let owed = take_owed(&mut docs);
         assert_eq!(owed.len(), 1);
         assert_eq!(owed[0].0, 2);
+    }
+
+    #[test]
+    fn reopen_all_sends_current_text_with_next_versions() {
+        const V: &str = "file:///p/B.hs";
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(1, &open(V, 5, "b")).unwrap();
+        docs.did_open(1, &open(U, 5, "a")).unwrap();
+        docs.did_change(1, &change(U, 6, full("a2"))).unwrap();
+        // client 2 moves the server onto its text
+        docs.did_open(2, &open(U, 1, "other")).unwrap();
+        let server_version = |docs: &Docs, uri: &str| docs.docs[uri].server.version;
+        let before = server_version(&docs, U);
+
+        let reopened = docs.reopen_all();
+        assert_eq!(methods(&reopened), ["textDocument/didOpen"; 2]);
+        // in URI order, with the server's text and the next version
+        assert_eq!(reopened[0].params["textDocument"]["uri"], U);
+        assert_eq!(reopened[0].params["textDocument"]["text"], "other");
+        assert_eq!(reopened[0].params["textDocument"]["languageId"], "haskell");
+        assert_eq!(reopened[0].params["textDocument"]["version"], before + 1);
+        assert_eq!(reopened[1].params["textDocument"]["uri"], V);
+        assert_eq!(reopened[1].params["textDocument"]["text"], "b");
+
+        // numbering keeps going up for later changes
+        docs.did_change(1, &change(U, 7, full("a3"))).unwrap();
+        assert!(server_version(&docs, U) > before + 1);
+
+        // client texts are untouched
+        assert_eq!(docs.docs[U].clients[&1].text, "a3");
+        assert!(Docs::new(PositionEncoding::Utf16).reopen_all().is_empty());
+    }
+
+    #[test]
+    fn reopened_documents_are_answered_only_after_the_new_server_checked_them() {
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(1, &open(U, 10, "a")).unwrap();
+        docs.publish_diagnostics(diags(U, Some(1), 2), &[1]);
+        assert_eq!(take_owed(&mut docs).len(), 0);
+
+        docs.reopen_all();
+        // the cache stays for clients connecting later
+        assert_eq!(docs.replay_diagnostics().len(), 1);
+        assert!(docs.any_owed());
+
+        // settled without the new server publishing: it found nothing, the
+        // old server's cache doesn't answer
+        let owed = take_owed(&mut docs);
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].1["diagnostics"], json!([]));
+        assert_eq!(owed[0].1["version"], 10);
+        assert_eq!(docs.replay_diagnostics().len(), 0);
+        assert!(!docs.any_owed());
+
+        // a publish of the new server is delivered and clears the debt
+        let mut docs = Docs::new(PositionEncoding::Utf16);
+        docs.did_open(1, &open(U, 10, "a")).unwrap();
+        docs.publish_diagnostics(diags(U, Some(1), 2), &[1]);
+        let reopened = docs.reopen_all();
+        let version = reopened[0].params["textDocument"]["version"].as_i64();
+        let deliveries = docs.publish_diagnostics(diags(U, version, 1), &[1]);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].1.params["version"], 10);
+        assert!(!docs.any_owed());
+        assert_eq!(docs.replay_diagnostics().len(), 1);
+        // and later answers use the cache again
+        docs.did_change(1, &change(U, 11, full("a"))).unwrap();
+        let owed = take_owed(&mut docs);
+        assert_eq!(owed[0].1["diagnostics"], diags(U, None, 1)["diagnostics"]);
     }
 }

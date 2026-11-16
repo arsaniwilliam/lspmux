@@ -225,6 +225,30 @@ impl Registrations {
         deliveries
     }
 
+    /// The server process was replaced: forget every registration of the old
+    /// one, returns what each client must be unregistered
+    ///
+    /// The new server registers what it needs on its own, with ids of its
+    /// own. Unregistering first means the clients end up with exactly the
+    /// new set, however much it overlaps the old one, and never with the
+    /// same capability twice.
+    pub fn unregister_all(&mut self) -> Vec<(usize, Vec<Unregistration>)> {
+        let mut deliveries = Vec::<(usize, Vec<Unregistration>)>::new();
+        for entry in self.entries.drain(..) {
+            for client_id in entry.receivers {
+                push_to(
+                    &mut deliveries,
+                    client_id,
+                    Unregistration {
+                        id: entry.registration.id.clone(),
+                        method: entry.registration.method.clone(),
+                    },
+                );
+            }
+        }
+        deliveries
+    }
+
     /// The client whose `workspace/didChangeWatchedFiles` reach the server:
     /// the earliest connected one which received a watched files
     /// registration
@@ -456,5 +480,87 @@ mod tests {
         registrations.remove_client(4);
         assert_eq!(registrations.watcher(), None);
         assert!(registrations.forwards_watched_files_from(OMP));
+    }
+
+    /// What a client holds after the deliveries it was sent
+    fn client_holds(
+        held: &mut Vec<(String, String)>,
+        registrations: &[Registration],
+        unregistrations: &[Unregistration],
+    ) {
+        for u in unregistrations {
+            let before = held.len();
+            held.retain(|(id, _)| *id != u.id);
+            assert_eq!(before - held.len(), 1, "unregistered an unknown id {}", u.id);
+        }
+        for r in registrations {
+            assert!(
+                !held.iter().any(|(id, _)| *id == r.id),
+                "registered {} twice",
+                r.id
+            );
+            held.push((r.id.clone(), r.method.clone()));
+        }
+    }
+
+    #[test]
+    fn recycle_reconciles_registrations_without_duplicates() {
+        let mut registrations = Registrations::default();
+        registrations.add_client(NVIM, watching());
+        registrations.add_client(OMP, static_only());
+        let mut nvim = Vec::new();
+        let mut omp = Vec::new();
+        let mut deliver = |deliveries: Vec<(usize, Vec<Registration>)>,
+                           unregistrations: Vec<(usize, Vec<Unregistration>)>| {
+            for (client, items) in unregistrations {
+                let held = if client == NVIM { &mut nvim } else { &mut omp };
+                client_holds(held, &[], &items);
+            }
+            for (client, items) in deliveries {
+                let held = if client == NVIM { &mut nvim } else { &mut omp };
+                client_holds(held, &items, &[]);
+            }
+        };
+
+        // old server: watcher plus a command registration
+        let old = registrations.register(vec![
+            registration("old-watch", WATCHED_FILES),
+            registration("old-cmd", "haskell/custom"),
+        ]);
+        deliver(old, Vec::new());
+
+        // the swap: everything of the old server goes away, to receivers only
+        let unregistrations = registrations.unregister_all();
+        assert_eq!(
+            ids(&unregistrations, |u| &u.id),
+            [
+                (NVIM, vec!["old-watch".into(), "old-cmd".into()]),
+                (OMP, vec!["old-cmd".into()])
+            ]
+        );
+        assert!(registrations.methods().is_empty());
+        assert_eq!(registrations.watcher(), None);
+        deliver(Vec::new(), unregistrations);
+
+        // the new server registers the same watcher (even under the same id)
+        // and drops the command
+        let new = registrations.register(vec![registration("old-watch", WATCHED_FILES)]);
+        assert_eq!(ids(&new, |r| &r.id), [(NVIM, vec!["old-watch".into()])]);
+        deliver(new, Vec::new());
+
+        // exactly the new set, once
+        assert_eq!(nvim, [("old-watch".to_owned(), WATCHED_FILES.to_owned())]);
+        assert!(omp.is_empty());
+        assert_eq!(registrations.methods(), [WATCHED_FILES]);
+        assert_eq!(registrations.watcher(), Some(NVIM));
+
+        // a client connecting later is replayed the new set only
+        let replay = registrations.add_client(OTHER, watching());
+        let replay = replay.iter().map(|r| r.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(replay, ["old-watch"]);
+
+        // unregistering nothing is fine
+        let mut empty = Registrations::default();
+        assert!(empty.unregister_all().is_empty());
     }
 }

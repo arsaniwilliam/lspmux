@@ -1,9 +1,11 @@
 mod capabilities;
 mod client;
+mod commands;
 mod docs;
 mod instance;
 mod lsp;
 mod progress;
+mod recycle;
 mod settings;
 mod socketwrapper;
 

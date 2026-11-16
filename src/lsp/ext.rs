@@ -15,8 +15,9 @@ pub enum Tag {
     ClientId(usize),
     /// Response to this request should be ignored
     Drop,
-    /// Response to this request should be forwarded
-    Forward,
+    /// Response to this request should be forwarded to the server process of
+    /// this generation, a response to a request of an older process is dropped
+    Forward(u64),
 }
 
 impl RequestId {
@@ -25,7 +26,7 @@ impl RequestId {
         let tag = match tag {
             Tag::ClientId(client_id) => format!("client_id:{client_id}"),
             Tag::Drop => "drop".into(),
-            Tag::Forward => "forward".into(),
+            Tag::Forward(generation) => format!("forward:{generation}"),
         };
         let id = match self {
             RequestId::Number(number) => format!("n:{number}"),
@@ -68,8 +69,10 @@ impl RequestId {
             }
 
             if let Some(rest) = input.strip_prefix("forward:") {
+                let (generation, rest) = rest.split_once(':').context("missing `:`")?;
+                let generation = u64::from_str(generation).context("invalid generation")?;
                 let inner_id = parse_inner_id(rest).context("failed to parse inner ID")?;
-                return Ok((Tag::Forward, inner_id));
+                return Ok((Tag::Forward(generation), inner_id));
             }
 
             bail!("unrecognized prefix: {input:?}");
@@ -170,6 +173,15 @@ pub struct Instance {
     pub registered_dyn_capabilities: Vec<String>,
     pub last_used: i64,
     pub clients: Vec<Client>,
+    /// How many times the server process was replaced by `recycle`
+    #[serde(default)]
+    pub recycles: u64,
+    /// Latest logged live heap bytes of the current process, in MB
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_mb: Option<f64>,
+    /// Latest `VmRSS + VmSwap` of the current process, in MB
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_mb: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -271,5 +283,22 @@ mod tests {
                 "args": ["a", "b", "c"],
             },
         }))
+    }
+
+    #[test]
+    fn tags_round_trip() {
+        use super::{RequestId, Tag};
+
+        let id = RequestId::String("abc:d".into());
+        let tagged = id.tag(Tag::Forward(7));
+        assert_eq!(tagged, "forward:7:s:abc:d");
+        match tagged.untag() {
+            (Some(Tag::Forward(7)), RequestId::String(inner)) => assert_eq!(inner, "abc:d"),
+            _ => panic!("generation lost"),
+        }
+        assert!(matches!(
+            RequestId::Number(3).tag(Tag::ClientId(2)).untag(),
+            (Some(Tag::ClientId(2)), RequestId::Number(3))
+        ));
     }
 }

@@ -193,6 +193,27 @@ settle_ms = 1500
 # there are no entries by default.
 [server_settings]
 # "haskell-language-server-wrapper" = "~/.config/lspmux/settings/hls.json"
+
+# milliseconds between reads of `/proc/<pid>/status` of servers with a
+# `recycle` entry, the value must be at least 1
+memory_poll_ms = 2000
+
+# memory limits at which lspmux replaces a server process, keyed by the
+# `--server-path` value, all in MB and all optional. a server without an
+# entry is never recycled. see "Recycling a leaking server" below.
+#
+# soft_live_mb:   the latest logged live heap bytes (`Live bytes: <n>MB Heap
+#                 size: <n>MB` on stderr, haskell-language-server logs it every
+#                 60 s) reach this: recycle at the next settled moment
+# forced_live_mb: live heap bytes reach this: recycle immediately
+# max_memory_mb:  the process' `VmRSS + VmSwap` reach this: recycle immediately
+#
+# there are no entries by default.
+[recycle]
+# [recycle."haskell-language-server-wrapper"]
+# soft_live_mb = 12288
+# forced_live_mb = 24576
+# max_memory_mb = 32768
 ```
 
 
@@ -223,6 +244,61 @@ support different parts of the protocol. lspmux keeps every client's
   which ends right away, so clients waiting for the server to finish loading
   don't have to time out
 - answers owed diagnostics once the server settled, see `settle_ms`
+
+
+## Recycling a leaking server
+
+haskell-language-server never frees what a cradle reload (editing
+`package.yaml`) loads, one shared instance can grow past 40 GB. With a
+`[recycle."<server-path>"]` entry lspmux replaces the server process behind
+its connected clients, which neither disconnect nor restart:
+
+- **soft** (`soft_live_mb`): the server's latest logged live bytes reach the
+  limit. lspmux waits for a settled moment: no client request and no
+  `workspace/executeCommand` in flight, no server progress, `settle_ms` of
+  quiet. Re-evaluated on the settle tick.
+- **forced** (`forced_live_mb`, `max_memory_mb`): live bytes or the process'
+  `VmRSS + VmSwap` (polled every `memory_poll_ms`) reach the limit. Recycled
+  immediately.
+- **guard**: no soft recycle within 5 minutes of the previous recycle. A forced
+  recycle is always allowed. After 3 forced recycles within 15 minutes lspmux
+  logs an error and stops recycling that instance.
+
+The old process is stopped (`shutdown`, `exit`, SIGKILL after 2 s) before the
+new one is spawned. Meanwhile client messages wait; afterwards the new server is
+initialized with the same `initialize` params and settings, every open document
+is `didOpen`ed in it with the next server version, and the waiting messages
+follow in order. Clients get:
+
+- `-32801` (`ContentModified`), `lspmux: language server restarted`, for every
+  request the old server didn't answer yet; their replies to server requests
+  of the old process are dropped
+- `$/progress` `end` for the old server's active progress
+- an unregistration of all the old server's dynamic registrations, then the
+  new server's registrations, so they hold each capability once
+- `workspace/codeLens|semanticTokens|inlayHint|diagnostic/refresh` when they
+  declare `refreshSupport`
+- the `InitializeResult` they got on connect, unchanged. lspmux logs a warning
+  when the new server's capabilities differ from it.
+
+Diagnostics clients already have stay until the new server republishes; owed
+diagnostics are answered only after the new server checked the text. A process
+which exits on its own is not respawned: everyone is disconnected as ever.
+`lspmux status` shows the current pid, the number of recycles and the last
+live/RSS numbers.
+
+### pid-prefixed command ids
+
+haskell-language-server prefixes its command ids with its pid
+(`1222517:eval:evalCommand`), which would break the commands clients cached
+(Neovim only runs commands listed in the `InitializeResult` it got). For
+servers listing commands starting with their own pid lspmux shows the clients
+`lspmux:<rest>` instead of `<pid>:<rest>`: in `executeCommandProvider.commands`,
+dynamic `workspace/executeCommand` registrations and every string under a
+`command` key of server messages, and rewrites `lspmux:<rest>` back to the
+current pid in client requests (`workspace/executeCommand`, `codeLens/resolve`,
+`codeAction/resolve`, ...). A lens fetched before a recycle runs on the new
+server.
 
 
 ## Other LSP servers

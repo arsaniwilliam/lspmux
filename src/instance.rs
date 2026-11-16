@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::ops::Deref;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,14 +14,15 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::error::SendError;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::time::MissedTickBehavior;
 use tokio::{select, task};
 use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
 use crate::capabilities::{self, refresh_capability, Registrations, REFRESH_REQUESTS};
 use crate::client::Client;
-use crate::config::Config;
+use crate::commands;
+use crate::config::{Config, RecycleConfig};
 use crate::docs::{self, Docs, PositionEncoding, ReadUri, Snapshot};
 use crate::lsp::ext::Tag;
 use crate::lsp::jsonrpc::{
@@ -30,7 +31,10 @@ use crate::lsp::jsonrpc::{
 use crate::lsp::transport::{LspReader, LspWriter};
 use crate::lsp::{self, ext};
 use crate::progress::Progress;
+use crate::recycle::{self, Readings};
 use crate::settings;
+
+mod swap;
 
 /// Specifies server configuration
 ///
@@ -56,11 +60,11 @@ pub struct InstanceKey {
 /// `docs` is held across sends into the server channel so client document
 /// resyncs and the request they're for reach the server without other
 /// clients' messages in between.
+///
+/// The `gate` is acquired before all of them. While a recycle holds it for
+/// writing nothing else talks to the server.
 pub struct Instance {
     key: InstanceKey,
-
-    /// Language server child process id
-    pid: u32,
 
     /// Server's response to `initialize` request, rewritten for clients
     init_result: lsp::InitializeResult,
@@ -68,9 +72,6 @@ pub struct Instance {
     /// Response to `workspace/workspaceFolders` server requests: the folders
     /// the instance was initialized with
     workspace_folders: Value,
-
-    /// Handle for sending messages to the language server instance
-    server: mpsc::Sender<Message>,
 
     /// Associated clients
     clients: Mutex<HashMap<usize, Client>>,
@@ -104,6 +105,36 @@ pub struct Instance {
     /// Wakes up `wait_task` and asks it to send SIGKILL to the instance.
     close: Notify,
 
+    /// The server process behind the instance, replaced by `recycle`
+    link: std::sync::Mutex<Link>,
+
+    /// Params of the `initialize` request the server is initialized with,
+    /// after lspmux forced its capabilities and settings. A recycled server
+    /// gets the same ones.
+    init_params: lsp::InitializeParams,
+
+    /// The server prefixes its command ids with its pid, clients see stable
+    /// `lspmux:` ids instead ([`commands`])
+    pid_commands: bool,
+
+    /// Held for reading by everything which talks to the server process or
+    /// reads its messages, for writing while the process is being replaced.
+    /// Client messages arriving meanwhile wait, and reach the new server in
+    /// order. Outermost in the lock order: acquire before any mutex.
+    gate: RwLock<()>,
+
+    /// Latest memory numbers of the current server process
+    readings: Arc<Readings>,
+
+    /// Wakes up the recycle monitor when numbers changed
+    wake: Arc<Notify>,
+
+    /// The instance map holding this instance
+    map: Weak<Mutex<InstanceMap>>,
+
+    /// The instance was taken down, it must not be recycled anymore
+    dead: AtomicBool,
+
     /// Last time a message was sent to this instance
     ///
     /// Uses UTC unix timestamp ([utc_now] function)
@@ -115,6 +146,34 @@ impl Drop for Instance {
         // Make sure we're not leaking anything
         debug!("instance dropped");
     }
+}
+
+/// The server process behind an instance
+struct Link {
+    /// Starts at 1, increases with every replacement of the process
+    generation: u64,
+
+    /// Language server child process id
+    pid: u32,
+
+    /// Handle for sending messages to the language server process
+    sender: mpsc::Sender<Message>,
+
+    ctl: Arc<ProcessCtl>,
+}
+
+/// Signals between a server process' `wait_task` and the recycle
+#[derive(Default)]
+struct ProcessCtl {
+    /// The process exit is part of a recycle, `wait_task` leaves the
+    /// instance and its clients alone
+    expected_exit: AtomicBool,
+
+    /// Asks `wait_task` to send SIGKILL to the process
+    kill: Notify,
+
+    /// `wait_task` saw the process exit
+    exited: Notify,
 }
 
 /// A client `workspace/executeCommand` request the server hasn't responded to
@@ -385,6 +444,17 @@ fn translated_for_each(
         .collect()
 }
 
+/// Show a message of the server process `pid` to the clients with stable
+/// command ids ([`commands`])
+fn commands_for_clients(message: &mut Message, pid: u32) {
+    match message {
+        Message::ResponseSuccess(res) => commands::to_clients(&mut res.result, pid),
+        Message::Request(req) => commands::to_clients(&mut req.params, pid),
+        Message::Notification(notif) => commands::to_clients(&mut notif.params, pid),
+        Message::ResponseError(_) => {}
+    }
+}
+
 // Current unix timestamp with second precission
 fn utc_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -418,6 +488,36 @@ impl Instance {
         self.init_result.clone()
     }
 
+    /// Process id of the current language server process
+    pub fn pid(&self) -> u32 {
+        self.link().pid
+    }
+
+    /// Generation of the current language server process, starts at 1 and
+    /// increases whenever the process is replaced
+    fn generation(&self) -> u64 {
+        self.link().generation
+    }
+
+    fn link(&self) -> std::sync::MutexGuard<'_, Link> {
+        self.link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take the instance down after its server process died unexpectedly:
+    /// new clients spawn their own instance, current clients are
+    /// disconnected
+    ///
+    /// We rely on the editor client to restart the lspmux client, start a
+    /// new connection and we'll spawn another instance like we'd with any
+    /// other new client.
+    async fn terminate(&self, instance_map: &Mutex<InstanceMap>) {
+        self.dead.store(true, Ordering::SeqCst);
+        instance_map.lock().await.instances.remove(&self.key);
+        self.clients.lock().await.clear();
+    }
+
     /// Does lspmux answer the server's configuration requests itself
     pub fn owns_settings(&self) -> bool {
         self.settings.is_some()
@@ -428,6 +528,7 @@ impl Instance {
     /// It replays the registered dynamic capabilities the client supports,
     /// all cached diagnostics and active progress to it.
     pub async fn add_client(&self, client: Client) {
+        let _gate = self.gate.read().await;
         let mut clients = self.clients.lock().await;
 
         let registrations = self
@@ -472,6 +573,7 @@ impl Instance {
     pub async fn cleanup_client(&self, client: Client) -> Result<()> {
         debug!("cleaning up client");
 
+        let _gate = self.gate.read().await;
         let mut clients = self.clients.lock().await;
         let removed = clients.remove(&client.id());
         if clients.is_empty() {
@@ -521,12 +623,16 @@ impl Instance {
     pub async fn forward_request(
         &self,
         client_id: usize,
-        req: Request,
+        mut req: Request,
     ) -> Result<(), SendError<Message>> {
+        let _gate = self.gate.read().await;
         let mut docs = self.docs.lock().await;
         for notif in docs.sync_for_request(client_id, &req.params) {
             debug!(?notif, "syncing server document to requesting client");
             self.send_sync(notif).await?;
+        }
+        if self.pid_commands {
+            commands::to_server(&mut req.params, self.pid());
         }
         // Recorded before sending so the response can't overtake it.
         let key = request_key(&req.id);
@@ -563,8 +669,27 @@ impl Instance {
         &self,
         notif: Notification,
     ) -> Result<(), SendError<Message>> {
+        let _gate = self.gate.read().await;
         let _docs = self.docs.lock().await;
         self.send_message(notif.into()).await
+    }
+
+    /// Forward a client's response to a server request tagged with the
+    /// `generation` of the server process which sent it
+    ///
+    /// A reply to a request of a replaced process is dropped, it must never
+    /// reach the new one.
+    pub async fn forward_response(
+        &self,
+        generation: u64,
+        message: Message,
+    ) -> Result<(), SendError<Message>> {
+        let _gate = self.gate.read().await;
+        if self.generation() != generation {
+            debug!(generation, "dropping reply to a request of a replaced server process");
+            return Ok(());
+        }
+        self.send_message(message).await
     }
 
     /// Should `workspace/didChangeWatchedFiles` from `client_id` reach the
@@ -590,7 +715,8 @@ impl Instance {
 
     /// Send a message to the language server channel
     pub async fn send_message(&self, message: Message) -> Result<(), SendError<Message>> {
-        self.server.send(message).await
+        let sender = self.link().sender.clone();
+        sender.send(message).await
     }
 
     /// Send a document notification to the server
@@ -624,6 +750,7 @@ impl Instance {
     ///
     /// Returns diagnostics the client should receive.
     pub async fn open_file(&self, client_id: usize, params: Value) -> Result<Vec<Notification>> {
+        let _gate = self.gate.read().await;
         let mut docs = self.docs.lock().await;
         let effects = docs.did_open(client_id, &params)?;
         Ok(self.send_effects(effects).await)
@@ -631,6 +758,7 @@ impl Instance {
 
     /// Handle `textDocument/didChange` client notification
     pub async fn change_file(&self, client_id: usize, params: Value) -> Result<()> {
+        let _gate = self.gate.read().await;
         let mut docs = self.docs.lock().await;
         let effects = docs.did_change(client_id, &params)?;
         self.send_effects(effects).await;
@@ -643,6 +771,7 @@ impl Instance {
         client_id: usize,
         notif: Notification,
     ) -> Result<(), SendError<Message>> {
+        let _gate = self.gate.read().await;
         let mut docs = self.docs.lock().await;
         if let Some(uri) = notif.params["textDocument"]["uri"].as_str() {
             docs.did_save(client_id, uri);
@@ -655,6 +784,7 @@ impl Instance {
         let uri = params["textDocument"]["uri"]
             .as_str()
             .context("missing textDocument.uri")?;
+        let _gate = self.gate.read().await;
         let mut docs = self.docs.lock().await;
         let effects = docs.did_close(client_id, uri);
         self.send_effects(effects).await;
@@ -663,6 +793,7 @@ impl Instance {
 
     /// Send owed diagnostics if the server settled
     async fn answer_owed_diagnostics(&self) {
+        let _gate = self.gate.read().await;
         let clients = self.clients.lock().await;
         let deliveries = {
             let mut docs = self.docs.lock().await;
@@ -696,9 +827,10 @@ impl Instance {
         };
 
         let registered_dyn_capabilities = self.dynamic_capabilities.lock().await.methods();
+        let sample = self.readings.sample();
 
         ext::Instance {
-            pid: self.pid,
+            pid: self.pid(),
             server: self.key.server.clone(),
             args: self.key.args.clone(),
             env: self.key.env.clone(),
@@ -706,6 +838,9 @@ impl Instance {
             last_used: self.last_used.load(Ordering::Relaxed),
             clients,
             registered_dyn_capabilities,
+            recycles: self.readings.recycles(),
+            live_mb: sample.live_mb,
+            rss_mb: sample.rss_mb,
         }
     }
 }
@@ -713,7 +848,9 @@ impl Instance {
 /// What instances take from the configuration
 struct InstanceOptions {
     settle: Duration,
+    memory_poll: Duration,
     server_settings: BTreeMap<String, String>,
+    recycle: BTreeMap<String, RecycleConfig>,
 }
 
 pub struct InstanceMap {
@@ -727,7 +864,9 @@ impl InstanceMap {
             instances: HashMap::new(),
             options: Arc::new(InstanceOptions {
                 settle: Duration::from_millis(config.settle_ms),
+                memory_poll: Duration::from_millis(config.memory_poll_ms),
                 server_settings: config.server_settings.clone(),
+                recycle: config.recycle.clone(),
             }),
         }));
         task::spawn(gc_task(
@@ -777,7 +916,7 @@ async fn gc_task(
             if let Some(instance_timeout) = instance_timeout {
                 // Close timed out instance
                 if idle > i64::from(instance_timeout) && clients.is_empty() {
-                    info!(pid = instance.pid, path = ?key.workspace_root, idle, "instance timed out");
+                    info!(pid = instance.pid(), path = ?key.workspace_root, idle, "instance timed out");
                     instance.close.notify_one();
                 }
             }
@@ -819,7 +958,6 @@ pub async fn get_or_spawn(
     }
 }
 
-#[instrument(name = "instance", fields(pid = field::Empty), skip_all, parent = None)]
 async fn spawn(
     key: InstanceKey,
     mut init_req_params: lsp::InitializeParams,
@@ -829,48 +967,6 @@ async fn spawn(
     // are allowed to lock it again.
     map: Arc<Mutex<InstanceMap>>,
 ) -> Result<Arc<Instance>> {
-    let mut child = Command::new(&key.server)
-        .args(&key.args)
-        .envs(&key.env)
-        .current_dir(&key.workspace_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            let InstanceKey {
-                server,
-                args,
-                env,
-                workspace_root,
-            } = &key;
-            let path = env
-                .get("PATH")
-                .map(<_>::to_owned)
-                // Display PATH from our environment Command will if none was
-                // passed from the client environment.
-                .or_else(|| env::var("PATH").ok())
-                .unwrap_or_default();
-            format!(
-                "spawning language server: server={server:?}, args={args:?}, \
-                cwd={workspace_root:?}, path={path:?}, env={env:?}",
-            )
-        })?;
-
-    let pid = child.id().context("child exited early, couldn't get PID")?;
-    tracing::Span::current().record("pid", pid);
-
-    info!(server = ?key.server, args = ?key.args, cwd = ?key.workspace_root, "spawned language server");
-
-    let stderr = child.stderr.take().unwrap();
-    task::spawn(stderr_task(stderr).in_current_span());
-
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = LspReader::new(BufReader::new(stdout), "server");
-
-    let stdin = child.stdin.take().unwrap();
-    let mut writer = LspWriter::new(stdin, "server");
-
     let workspace_folders = initial_workspace_folders(&init_req_params);
 
     let settings =
@@ -897,26 +993,56 @@ async fn spawn(
     }
     let settings = settings.map(Value::Object);
 
-    let mut init_result =
-        initialize_handshake(init_req_params, settings.as_ref(), &mut reader, &mut writer)
-            .await
-            .context("server handshake")?;
-
-    info!("initialized server");
+    let generation = 1;
+    let readings = Arc::new(Readings::new(generation));
+    let wake = Arc::new(Notify::new());
+    let process = swap::start_process(
+        &key,
+        init_req_params.clone(),
+        settings.as_ref(),
+        generation,
+        &readings,
+        &wake,
+    )
+    .await
+    .context("server handshake")?;
+    let swap::Process {
+        child,
+        pid,
+        reader,
+        writer,
+        mut init_result,
+        span,
+    } = process;
 
     // Clients send us full text changes, we keep their copies and decide
     // what the server sees.
     let encoding = PositionEncoding::from_server_capabilities(&init_result.capabilities);
     docs::rewrite_text_document_sync(&mut init_result.capabilities);
 
+    // Command ids with the pid in them can't be shown to clients as they
+    // are, the pid changes whenever the process is replaced.
+    let pid_commands = commands::uses_pid_commands(&init_result.capabilities, pid);
+    if pid_commands {
+        info!("server prefixes command ids with its pid, clients get stable `lspmux:` ids");
+        commands::capabilities_for_clients(&mut init_result.capabilities, pid);
+    }
+
     let (message_writer, rx) = mpsc::channel(64);
+    let ctl = Arc::new(ProcessCtl::default());
 
     let instance = Arc::new(Instance {
         key,
-        pid,
+        link: std::sync::Mutex::new(Link {
+            generation,
+            pid,
+            sender: message_writer,
+            ctl: ctl.clone(),
+        }),
         init_result,
+        init_params: init_req_params,
+        pid_commands,
         workspace_folders,
-        server: message_writer,
         clients: Mutex::default(),
         dynamic_capabilities: Mutex::default(),
         docs: Mutex::new(Docs::new(encoding)),
@@ -925,15 +1051,29 @@ async fn spawn(
         settings,
         request_snapshots: Mutex::default(),
         execute_commands: Mutex::default(),
+        gate: RwLock::new(()),
+        readings,
+        wake: wake.clone(),
+        map: Arc::downgrade(&map),
+        dead: AtomicBool::new(false),
         close: Notify::new(),
         last_used: AtomicI64::new(utc_now()),
     });
 
-    task::spawn(stdout_task(instance.clone(), reader).in_current_span());
-    task::spawn(stdin_task(rx, writer).in_current_span());
-    task::spawn(settle_task(Arc::downgrade(&instance)).in_current_span());
+    task::spawn(stdout_task(instance.clone(), generation, pid, reader).instrument(span.clone()));
+    task::spawn(stdin_task(rx, writer).instrument(span.clone()));
+    task::spawn(settle_task(Arc::downgrade(&instance)));
+    task::spawn(wait_task(instance.clone(), ctl, map, child).instrument(span));
 
-    task::spawn(wait_task(instance.clone(), map, child).in_current_span());
+    if let Some(config) = options.recycle.get(&instance.key.server) {
+        info!(?config, "recycling the server process at memory limits");
+        task::spawn(swap::monitor_task(
+            Arc::downgrade(&instance),
+            *config,
+            options.memory_poll,
+            wake,
+        ));
+    }
 
     Ok(instance)
 }
@@ -1020,7 +1160,15 @@ async fn settle_task(instance: Weak<Instance>) {
 }
 
 /// Read errors from language server stderr and log them
-async fn stderr_task(stderr: ChildStderr) {
+///
+/// Heap statistics lines feed the recycle triggers of the process of
+/// `generation`.
+async fn stderr_task(
+    stderr: ChildStderr,
+    generation: u64,
+    readings: Arc<Readings>,
+    wake: Arc<Notify>,
+) {
     let mut stderr = BufReader::new(stderr);
     let mut buffer = String::new();
 
@@ -1035,6 +1183,11 @@ async fn stderr_task(stderr: ChildStderr) {
             Ok(_) => {
                 let line = buffer.trim_end(); // remove trailing '\n' or possibly '\r\n'
                 error!(%line, "stderr");
+                if let Some(stats) = recycle::parse_heap_line(line) {
+                    if readings.record_live(generation, stats.live_mb) {
+                        wake.notify_one();
+                    }
+                }
             }
             Err(err) => {
                 let err = anyhow::Error::from(err);
@@ -1066,12 +1219,17 @@ async fn stdin_task(mut receiver: mpsc::Receiver<Message>, mut writer: LspWriter
 }
 
 /// Wait for child and log when it exits
+///
+/// The exit of a process lspmux is replacing (`ctl.expected_exit`) is part of
+/// the recycle: the instance and its clients stay. Any other exit takes the
+/// instance down.
 async fn wait_task(
     instance: Arc<Instance>,
+    ctl: Arc<ProcessCtl>,
     instance_map: Arc<Mutex<InstanceMap>>,
     mut child: Child,
 ) {
-    let key = instance.key.clone();
+    let pid = child.id();
     loop {
         select! {
             _ = instance.close.notified() => {
@@ -1079,16 +1237,29 @@ async fn wait_task(
                     error!(?err, "failed to close child");
                 }
             }
+            _ = ctl.kill.notified() => {
+                if let Err(err) = child.start_kill() {
+                    error!(?err, "failed to kill child");
+                }
+            }
             exit = child.wait() => {
-                // Remove the closing instance from the map so new clients spawn their own instance
-                instance_map.lock().await.instances.remove(&key);
+                if ctl.expected_exit.load(Ordering::SeqCst) {
+                    match exit {
+                        Ok(status) => info!(?pid, ?status, "replaced server process exited"),
+                        Err(err) => error!(?err, "error waiting for the replaced server process"),
+                    }
+                    ctl.exited.notify_one();
+                    break;
+                }
 
+                // Remove the closing instance from the map so new clients spawn their own instance
+                //
                 // Disconnect all current clients
                 //
                 // We'll rely on the editor client to restart the lspmux client,
                 // start a new connection and we'll spawn another instance like
                 // we'd with any other new client.
-                instance.clients.lock().await.clear();
+                instance.terminate(&instance_map).await;
 
                 match exit {
                     Ok(status) => {
@@ -1131,7 +1302,12 @@ fn initial_workspace_folders(params: &lsp::InitializeParams) -> Value {
 }
 
 /// Read messages from server stdout and send them to corresponding client channels
-async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<ChildStdout>>) {
+async fn stdout_task(
+    instance: Arc<Instance>,
+    generation: u64,
+    pid: u32,
+    mut reader: LspReader<BufReader<ChildStdout>>,
+) {
     loop {
         let message = match reader.read_message().await {
             Ok(Some(message)) => message,
@@ -1144,6 +1320,20 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 continue;
             }
         };
+
+        // Held while the server process behind the clients is being replaced
+        let _gate = instance.gate.read().await;
+        if instance.generation() != generation {
+            // Whatever the replaced server still had to say, its requests
+            // were answered and its processing state is gone.
+            debug!(generation, "dropping message of a replaced server process");
+            break;
+        }
+
+        let mut message = message;
+        if instance.pid_commands {
+            commands_for_clients(&mut message, pid);
+        }
 
         // Lock _after_ we have a message to send, then send and immediately release the lock
         let clients = instance.clients.lock().await;
@@ -1269,7 +1459,7 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                     // from any client. So we'll just pick one and let it answer.
                     match request_for_client(&*instance.docs.lock().await, client.id(), req) {
                         Ok(mut req) => {
-                            req.id = req.id.tag(Tag::Forward);
+                            req.id = req.id.tag(Tag::Forward(generation));
                             let _ = client.send_message(req.into()).await;
                         }
                         Err(reply) => {
@@ -1403,7 +1593,7 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                             ?client_id,
                             "forwarding workspace/applyEdit to the client which triggered it"
                         );
-                        req.id = req.id.tag(Tag::Forward);
+                        req.id = req.id.tag(Tag::Forward(generation));
                         let _ = client.send_message(req.into()).await;
                     }
                     Err(reply) => {
@@ -1450,7 +1640,7 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                                     ?client_id,
                                     "forwarding {} to the client which triggered it", req.method
                                 );
-                                req.id = req.id.tag(Tag::Forward);
+                                req.id = req.id.tag(Tag::Forward(generation));
                                 let _ = client.send_message(req.into()).await;
                             }
                             Err(reply) => {
@@ -1514,7 +1704,7 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
                 let deliveries = {
                     let connected = clients.keys().copied().collect::<Vec<_>>();
                     let mut docs = instance.docs.lock().await;
-                    instance.progress.lock().await.touch(Instant::now());
+                    instance.progress.lock().await.server_activity(Instant::now());
                     docs.publish_diagnostics(notif.params, &connected)
                 };
                 for (client_id, notif) in deliveries {

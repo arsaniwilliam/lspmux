@@ -42,6 +42,10 @@ mod default {
     pub fn settle_ms() -> u64 {
         1500
     }
+
+    pub fn memory_poll_ms() -> u64 {
+        2000
+    }
 }
 
 mod de {
@@ -69,6 +73,20 @@ mod de {
             Err(_) => Err(Error::custom(
                 "invalid type: expected a non-negative integer or false",
             )),
+        }
+    }
+
+    /// make sure the value is greater than 0, a timer can't tick every 0ms
+    pub fn memory_poll_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u64::deserialize(deserializer)? {
+            0 => Err(Error::invalid_value(
+                Unexpected::Unsigned(0),
+                &"an integer 1 or greater",
+            )),
+            value => Ok(value),
         }
     }
 
@@ -123,10 +141,42 @@ pub struct Config {
     #[serde(default = "default::settle_ms")]
     pub settle_ms: u64,
 
+    /// Milliseconds between reads of `/proc/<pid>/status` of servers with a
+    /// `recycle` entry
+    #[serde(default = "default::memory_poll_ms")]
+    #[serde(deserialize_with = "de::memory_poll_ms")]
+    pub memory_poll_ms: u64,
+
     /// `--server-path` value to the JSON file with the settings lspmux
     /// answers `workspace/configuration` with
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub server_settings: BTreeMap<String, String>,
+
+    /// `--server-path` value to the memory limits at which lspmux replaces
+    /// the server process behind its connected clients
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recycle: BTreeMap<String, RecycleConfig>,
+}
+
+/// When to replace a language server process, all in MB
+///
+/// Without a limit the corresponding trigger doesn't exist.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecycleConfig {
+    /// Latest logged live heap bytes at which the server is replaced once it
+    /// settled
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_live_mb: Option<u64>,
+
+    /// Live heap bytes at which the server is replaced immediately
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_live_mb: Option<u64>,
+
+    /// `VmRSS + VmSwap` of the server process at which it is replaced
+    /// immediately
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u64>,
 }
 
 #[cfg(test)]
@@ -154,7 +204,9 @@ impl Default for Config {
             log_filters: default::log_filters(),
             pass_environment: default::pass_environment(),
             settle_ms: default::settle_ms(),
+            memory_poll_ms: default::memory_poll_ms(),
             server_settings: BTreeMap::new(),
+            recycle: BTreeMap::new(),
         }
     }
 }
@@ -194,5 +246,49 @@ impl Config {
             .with(filter)
             .with(format)
             .init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recycle_tables_per_server_path() {
+        let config: Config = toml::from_str(
+            r#"
+            memory_poll_ms = 500
+
+            [recycle."haskell-language-server-wrapper"]
+            soft_live_mb = 12288
+            forced_live_mb = 24576
+            max_memory_mb = 32768
+
+            [recycle.partial]
+            soft_live_mb = 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.memory_poll_ms, 500);
+        assert_eq!(
+            config.recycle["haskell-language-server-wrapper"],
+            RecycleConfig {
+                soft_live_mb: Some(12288),
+                forced_live_mb: Some(24576),
+                max_memory_mb: Some(32768),
+            }
+        );
+        assert_eq!(config.recycle["partial"].forced_live_mb, None);
+        assert!(!config.recycle.contains_key("rust-analyzer"));
+
+        // survives serialization
+        let again: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.recycle, config.recycle);
+    }
+
+    #[test]
+    fn recycle_rejects_unknown_keys_and_zero_poll() {
+        assert!(toml::from_str::<Config>("[recycle.x]\nsoft_mb = 1").is_err());
+        assert!(toml::from_str::<Config>("memory_poll_ms = 0").is_err());
     }
 }

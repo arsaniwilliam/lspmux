@@ -382,9 +382,13 @@ async fn output_task(
             }
 
             Message::ResponseSuccess(mut res) => match res.id.untag() {
-                (Some(Tag::Forward), id) => {
+                (Some(Tag::Forward(generation)), id) => {
                     res.id = id;
-                    if instance.send_message(res.into()).await.is_err() {
+                    if instance
+                        .forward_response(generation, res.into())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -397,9 +401,13 @@ async fn output_task(
             },
 
             Message::ResponseError(mut res) => match res.id.untag() {
-                (Some(Tag::Forward), id) => {
+                (Some(Tag::Forward(generation)), id) => {
                     res.id = id;
-                    if instance.send_message(res.into()).await.is_err() {
+                    if instance
+                        .forward_response(generation, res.into())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

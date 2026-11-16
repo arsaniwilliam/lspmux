@@ -95,6 +95,15 @@ pub async fn status(config: &Config, json: bool) -> Result<()> {
         println!("  path: {:?}", instance.workspace_root);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         println!("  last used: {}s ago", now - instance.last_used);
+        println!("  recycles: {}", instance.recycles);
+        match instance.live_mb {
+            Some(live) => println!("  live heap: {live:.0} MB"),
+            None => println!("  live heap: unknown"),
+        }
+        match instance.rss_mb {
+            Some(rss) => println!("  memory (rss + swap): {rss:.0} MB"),
+            None => println!("  memory (rss + swap): unknown"),
+        }
         println!("  registered dynamic capabilities:");
         for cap in instance.registered_dyn_capabilities {
             println!("    - {}", cap);

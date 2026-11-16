@@ -26,6 +26,10 @@ struct Token {
     report: Option<Value>,
 }
 
+/// How long a freshly started server may stay silent before it counts as
+/// settled anyway
+const STARTUP_GRACE: Duration = Duration::from_secs(30);
+
 pub struct Progress {
     /// Not ended yet, in creation order
     tokens: Vec<Token>,
@@ -34,6 +38,10 @@ pub struct Progress {
     last_activity: Instant,
     /// A client attached to the instance before
     attached: bool,
+    /// Since when a restarted server wasn't heard from, it isn't settled
+    /// before it showed any activity (or [`STARTUP_GRACE`] passed): it's
+    /// loading, not done
+    silent_since: Option<Instant>,
 }
 
 impl Progress {
@@ -42,11 +50,35 @@ impl Progress {
             tokens: Vec::new(),
             last_activity: now,
             attached: false,
+            silent_since: None,
         }
     }
 
+    /// Activity of lspmux towards the server, e.g. document sync
     pub fn touch(&mut self, now: Instant) {
         self.last_activity = self.last_activity.max(now);
+    }
+
+    /// Activity of the server: `publishDiagnostics` or `$/progress`
+    pub fn server_activity(&mut self, now: Instant) {
+        self.touch(now);
+        self.silent_since = None;
+    }
+
+    /// The server process is being replaced: its tokens are gone, returns
+    /// the `$/progress` end messages for the clients which saw them begin
+    pub fn end_all(&mut self) -> Vec<Message> {
+        self.tokens
+            .drain(..)
+            .filter(|token| token.begin.is_some())
+            .map(|token| progress(&token.token, json!({ "kind": "end" })))
+            .collect()
+    }
+
+    /// The replacement server process is up
+    pub fn restarted(&mut self, now: Instant) {
+        self.last_activity = now;
+        self.silent_since = Some(now);
     }
 
     fn token_mut(&mut self, token: &Value) -> Option<&mut Token> {
@@ -69,7 +101,7 @@ impl Progress {
 
     /// Handle `$/progress` server notification `params`
     pub fn progress(&mut self, params: &Value, now: Instant) {
-        self.touch(now);
+        self.server_activity(now);
         let token = &params["token"];
         let value = &params["value"];
         match value["kind"].as_str() {
@@ -102,6 +134,12 @@ impl Progress {
 
     /// No progress active and nothing happened for at least `settle`
     pub fn settled(&self, now: Instant, settle: Duration) -> bool {
+        if self
+            .silent_since
+            .is_some_and(|since| now.saturating_duration_since(since) < STARTUP_GRACE)
+        {
+            return false;
+        }
         !self.any_active() && now.saturating_duration_since(self.last_activity) >= settle
     }
 
@@ -294,5 +332,42 @@ mod tests {
         let mut progress = Progress::new(now);
         assert!(progress.attach(false).is_empty());
         assert_eq!(summary(&progress.attach(true)), announcement);
+    }
+
+    #[test]
+    fn restart_ends_begun_tokens_and_waits_for_the_new_server() {
+        let start = Instant::now();
+        let mut progress = Progress::new(start);
+        progress.create(&json!({ "token": "a" }));
+        progress.progress(&begin(json!("a"), "Indexing"), start);
+        progress.create(&json!({ "token": "created-only" }));
+        progress.progress(&begin(json!(7), "Processing"), start);
+
+        let restart = start + Duration::from_secs(100);
+        let ends = summary(&progress.end_all());
+        progress.restarted(restart);
+        assert_eq!(
+            ends,
+            [
+                ("$/progress".into(), end(json!("a"))),
+                ("$/progress".into(), end(json!(7))),
+            ]
+        );
+        // nothing left to replay
+        assert!(progress.attach(true).len() <= 3);
+
+        // quiet isn't enough while the new server hasn't said anything
+        assert!(!progress.settled(restart + Duration::from_secs(10), SETTLE));
+        // its first message makes the quiet time count again
+        let heard = restart + Duration::from_secs(5);
+        progress.server_activity(heard);
+        assert!(!progress.settled(heard, SETTLE));
+        assert!(progress.settled(heard + SETTLE, SETTLE));
+
+        // a server which never says anything settles after the grace time
+        let mut progress = Progress::new(start);
+        progress.restarted(restart);
+        assert!(!progress.settled(restart + STARTUP_GRACE - Duration::from_millis(1), SETTLE));
+        assert!(progress.settled(restart + STARTUP_GRACE, SETTLE));
     }
 }
